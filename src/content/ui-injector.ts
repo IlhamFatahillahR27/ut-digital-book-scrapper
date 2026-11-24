@@ -26,11 +26,11 @@ export class UiInjector {
       this.rootElement.id = ROOT_ELEMENT_ID;
       this.rootElement.style.cssText = `
         position: fixed !important;
-        bottom: 24px !important;
+        top: 80px !important;
         right: 24px !important;
         z-index: 2147483647 !important;
         display: block !important;
-        width: 320px !important;
+        width: auto !important;
         pointer-events: auto !important;
         margin: 0 !important;
         padding: 0 !important;

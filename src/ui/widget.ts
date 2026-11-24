@@ -6,6 +6,7 @@ import type { StartExportMessage, StopExportMessage } from '../types/messages';
 export class FloatingWidget {
   private shadowRoot: ShadowRoot;
   private isExporting = false;
+  private isMinimized = false;
   private currentTitle = '';
 
   constructor(shadowRoot: ShadowRoot) {
@@ -17,6 +18,7 @@ export class FloatingWidget {
     this.currentTitle = DomDetector.detectBookTitle();
     this.render();
     this.bindEvents();
+    this.setupDraggable();
   }
 
   private render(): void {
@@ -25,12 +27,15 @@ export class FloatingWidget {
     this.shadowRoot.innerHTML = `
       <style>${widgetCss}</style>
       <div class="rbv-card" id="rbv-card">
-        <div class="rbv-header">
+        <div class="rbv-header" id="rbv-header">
           <div class="rbv-title">
-            <img src="${iconUrl}" width="22" height="22" style="border-radius: 4px; object-fit: contain; background: #ffffff; padding: 1px;" alt="UT" />
-            <span>RBV-UT Exporter</span>
+            <img src="${iconUrl}" width="20" height="20" style="border-radius: 4px; object-fit: contain; background: #ffffff; padding: 1px;" alt="UT" />
+            <span>RBV-UT</span>
           </div>
-          <span class="rbv-badge">MV3 Beta</span>
+          <div class="rbv-header-actions">
+            <span class="rbv-badge">MV3</span>
+            <button class="rbv-icon-btn" id="rbv-btn-toggle" title="Perkecil / Perbesar panel">−</button>
+          </div>
         </div>
         <div class="rbv-body">
           <div class="rbv-book-info">
@@ -62,9 +67,87 @@ export class FloatingWidget {
   private bindEvents(): void {
     const startBtn = this.shadowRoot.querySelector('#rbv-btn-start') as HTMLButtonElement | null;
     const stopBtn = this.shadowRoot.querySelector('#rbv-btn-stop') as HTMLButtonElement | null;
+    const toggleBtn = this.shadowRoot.querySelector('#rbv-btn-toggle') as HTMLButtonElement | null;
 
     startBtn?.addEventListener('click', () => this.handleStart());
     stopBtn?.addEventListener('click', () => this.handleStop());
+    toggleBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.toggleMinimize();
+    });
+  }
+
+  private toggleMinimize(): void {
+    const card = this.shadowRoot.querySelector('#rbv-card');
+    const toggleBtn = this.shadowRoot.querySelector('#rbv-btn-toggle') as HTMLButtonElement | null;
+    
+    this.isMinimized = !this.isMinimized;
+    if (this.isMinimized) {
+      card?.classList.add('minimized');
+      if (toggleBtn) toggleBtn.textContent = '+';
+    } else {
+      card?.classList.remove('minimized');
+      if (toggleBtn) toggleBtn.textContent = '−';
+    }
+  }
+
+  private setupDraggable(): void {
+    const header = this.shadowRoot.querySelector('#rbv-header') as HTMLElement | null;
+    const host = this.shadowRoot.host as HTMLElement;
+
+    if (!header || !host) return;
+
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let initialLeft = 0;
+    let initialTop = 0;
+
+    header.addEventListener('mousedown', (e: MouseEvent) => {
+      // Don't drag if clicking buttons inside header
+      if ((e.target as HTMLElement).closest('.rbv-icon-btn')) {
+        return;
+      }
+
+      isDragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+
+      const rect = host.getBoundingClientRect();
+      initialLeft = rect.left;
+      initialTop = rect.top;
+
+      // Unset bottom/right and lock to left/top for absolute dragging
+      host.style.right = 'auto';
+      host.style.bottom = 'auto';
+      host.style.left = `${initialLeft}px`;
+      host.style.top = `${initialTop}px`;
+
+      const onMouseMove = (moveEvent: MouseEvent) => {
+        if (!isDragging) return;
+        const deltaX = moveEvent.clientX - startX;
+        const deltaY = moveEvent.clientY - startY;
+
+        let newLeft = initialLeft + deltaX;
+        let newTop = initialTop + deltaY;
+
+        // Keep inside screen boundaries
+        newLeft = Math.max(10, Math.min(window.innerWidth - host.offsetWidth - 10, newLeft));
+        newTop = Math.max(10, Math.min(window.innerHeight - host.offsetHeight - 10, newTop));
+
+        host.style.left = `${newLeft}px`;
+        host.style.top = `${newTop}px`;
+      };
+
+      const onMouseUp = () => {
+        isDragging = false;
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+      };
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    });
   }
 
   private async handleStart(): Promise<void> {

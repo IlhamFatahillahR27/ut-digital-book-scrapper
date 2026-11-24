@@ -2,7 +2,7 @@
   all: initial;
   display: block !important;
   position: fixed !important;
-  bottom: 24px !important;
+  top: 80px !important;
   right: 24px !important;
   z-index: 2147483647 !important;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -12,37 +12,79 @@
 }
 
 .rbv-card {
-  width: 320px;
+  width: 310px;
   background: #ffffff;
   border-radius: 12px;
-  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.15), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.2), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
   border: 1px solid #e2e8f0;
   overflow: hidden;
-  transition: all 0.25s ease-in-out;
+  transition: width 0.2s ease, box-shadow 0.2s ease;
+}
+
+.rbv-card.minimized {
+  width: 220px;
+}
+
+.rbv-card.minimized .rbv-body,
+.rbv-card.minimized .rbv-footer {
+  display: none;
 }
 
 .rbv-header {
   background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
   color: #ffffff;
-  padding: 12px 16px;
+  padding: 10px 14px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  cursor: grab;
+  user-select: none;
+}
+
+.rbv-header:active {
+  cursor: grabbing;
 }
 
 .rbv-title {
   font-weight: 600;
-  font-size: 14px;
+  font-size: 13px;
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
+.rbv-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rbv-icon-btn {
+  background: rgba(255, 255, 255, 0.15);
+  border: none;
+  color: #ffffff;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: bold;
+  line-height: 1;
+  transition: background-color 0.15s ease;
+}
+
+.rbv-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
 .rbv-badge {
   background: rgba(255, 255, 255, 0.2);
-  padding: 2px 6px;
+  padding: 2px 5px;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
