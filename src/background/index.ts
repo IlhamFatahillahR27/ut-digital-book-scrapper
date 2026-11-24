@@ -1,5 +1,6 @@
 import { DebuggerManager } from './debugger-manager';
 import { CdpPrinter } from './cdp-printer';
+import { ExportOrchestrator } from './export-orchestrator';
 import { MessageRouter } from './message-router';
 import { logger } from '../utils/logger';
 import type { ExtensionMessage } from '../types/messages';
@@ -8,7 +9,8 @@ logger.info('RBV-UT Background Service Worker initializing...');
 
 const debuggerManager = new DebuggerManager();
 const cdpPrinter = new CdpPrinter(debuggerManager);
-const messageRouter = new MessageRouter(debuggerManager, cdpPrinter);
+const exportOrchestrator = new ExportOrchestrator(debuggerManager, cdpPrinter);
+const messageRouter = new MessageRouter(debuggerManager, cdpPrinter, exportOrchestrator);
 
 chrome.runtime.onInstalled.addListener((details) => {
   logger.info(`RBV-UT Extension installed/updated. Reason: ${details.reason}`);

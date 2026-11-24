@@ -1,12 +1,29 @@
-import type { ExportProgress, ExporterConfig } from './exporter';
+import type {
+  BatchExportSummary,
+  BookStructureInfo,
+  ExportProgress,
+  ExportRangeRequest,
+  ExporterConfig
+} from './exporter';
 
-export type { ExportProgress, ExporterConfig };
+export type {
+  BatchExportSummary,
+  BookStructureInfo,
+  ExportProgress,
+  ExportRangeRequest,
+  ExporterConfig
+};
 
 export type MessageType =
   | 'PING'
   | 'PONG'
   | 'GET_STATUS'
   | 'STATUS_RESPONSE'
+  | 'GET_BOOK_STRUCTURE'
+  | 'ENSURE_SINGLE_PAGE_MODE'
+  | 'RESTORE_PAGE_VIEW_MODE'
+  | 'NAVIGATE_TO_CHAPTER'
+  | 'ABORT_NAVIGATION'
   | 'START_EXPORT'
   | 'START_TEST_PRINT'
   | 'PRINT_ISOLATED_PAGE'
@@ -36,12 +53,74 @@ export interface StatusResponseMessage {
   payload: ExportProgress;
 }
 
+export interface GetBookStructureMessage {
+  type: 'GET_BOOK_STRUCTURE';
+}
+
+export interface GetBookStructureResponse {
+  success: boolean;
+  data?: BookStructureInfo;
+  error?: string;
+}
+
+export interface EnsureSinglePageModeMessage {
+  type: 'ENSURE_SINGLE_PAGE_MODE';
+}
+
+export interface EnsureSinglePageModeResponse {
+  success: boolean;
+  wasSpreadMode: boolean;
+  changed: boolean;
+  message?: string;
+}
+
+export interface RestorePageViewModeMessage {
+  type: 'RESTORE_PAGE_VIEW_MODE';
+}
+
+export interface RestorePageViewModeResponse {
+  success: boolean;
+  restored: boolean;
+}
+
+export interface NavigateToChapterMessage {
+  type: 'NAVIGATE_TO_CHAPTER';
+  payload: {
+    targetChapter: number;
+    bookId?: string | null;
+    previousFingerprint?: string;
+    timeoutMs?: number;
+    quiescenceMs?: number;
+  };
+}
+
+export interface NavigateToChapterResponse {
+  success: boolean;
+  actualChapter: number | null;
+  chapterTitle: string;
+  fingerprint: string;
+  aborted?: boolean;
+  error?: string;
+}
+
+export interface AbortNavigationMessage {
+  type: 'ABORT_NAVIGATION';
+}
+
 export interface StartExportMessage {
   type: 'START_EXPORT';
   payload?: {
     config?: Partial<ExporterConfig>;
     bookTitle?: string;
+    range?: ExportRangeRequest;
   };
+}
+
+export interface StartExportResponse {
+  success: boolean;
+  message?: string;
+  summary?: BatchExportSummary;
+  error?: string;
 }
 
 export interface StartTestPrintMessage {
@@ -108,6 +187,7 @@ export interface ExportCompleteMessage {
     filename: string;
     totalChapters: number;
     downloadId?: number;
+    summary?: BatchExportSummary;
   };
 }
 
@@ -125,6 +205,11 @@ export type ExtensionMessage =
   | PongMessage
   | GetStatusMessage
   | StatusResponseMessage
+  | GetBookStructureMessage
+  | EnsureSinglePageModeMessage
+  | RestorePageViewModeMessage
+  | NavigateToChapterMessage
+  | AbortNavigationMessage
   | StartExportMessage
   | StartTestPrintMessage
   | PrintIsolatedPageMessage

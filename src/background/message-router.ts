@@ -1,16 +1,19 @@
 import type {
   ExtensionMessage,
   ExportProgress,
-  PrepareForPrintResponse
+  PrepareForPrintResponse,
+  ExportRangeRequest
 } from '../types/messages';
 import { logger } from '../utils/logger';
 import { DebuggerManager } from './debugger-manager';
 import { CdpPrinter } from './cdp-printer';
+import { ExportOrchestrator } from './export-orchestrator';
 import { sanitizeFilename } from '../utils/sanitize';
 
 export class MessageRouter {
   private debuggerManager: DebuggerManager;
   private cdpPrinter: CdpPrinter;
+  private orchestrator: ExportOrchestrator;
   private currentProgress: ExportProgress = {
     status: 'IDLE',
     currentChapter: 0,
@@ -18,9 +21,14 @@ export class MessageRouter {
     message: 'Ekstensi siap digunakan.'
   };
 
-  constructor(debuggerManager: DebuggerManager, cdpPrinter: CdpPrinter) {
+  constructor(
+    debuggerManager: DebuggerManager,
+    cdpPrinter: CdpPrinter,
+    orchestrator?: ExportOrchestrator
+  ) {
     this.debuggerManager = debuggerManager;
     this.cdpPrinter = cdpPrinter;
+    this.orchestrator = orchestrator ?? new ExportOrchestrator(debuggerManager, cdpPrinter);
   }
 
   handleMessage(
@@ -183,7 +191,7 @@ export class MessageRouter {
   }
 
   /**
-   * Initiates full book export session
+   * Phase 3: Initiates multi-chapter module / page-range auto-navigation export session
    */
   private async handleStartExport(
     message: Extract<ExtensionMessage, { type: 'START_EXPORT' }>,
@@ -192,51 +200,118 @@ export class MessageRouter {
   ): Promise<void> {
     const tabId = sender.tab?.id;
     if (!tabId) {
-      sendResponse({ success: false, error: 'No active tab found in sender context.' });
+      sendResponse({ success: false, error: 'Tidak ditemukan tab aktif pada pengirim.' });
       return;
     }
 
-    try {
-      this.updateProgress({
-        status: 'INITIALIZING',
-        currentChapter: 1,
-        chapterTitle: message.payload?.bookTitle || 'Menginisialisasi...',
-        message: 'Menghubungkan debugger ke tab Kotobee...'
-      });
-
-      await this.debuggerManager.attach(tabId);
-
+    if (this.orchestrator.isRunning()) {
       sendResponse({
-        success: true,
-        message: 'Export session initialized. Debugger attached.'
+        success: false,
+        error: 'Sesi ekspor sedang berjalan. Klik Berhenti terlebih dahulu jika ingin membatalkan.'
       });
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      this.updateProgress({
-        status: 'ERROR',
-        currentChapter: 0,
-        chapterTitle: 'Error',
-        message: `Gagal inisialisasi: ${errorMsg}`
-      });
-      await this.debuggerManager.detach();
-      sendResponse({ success: false, error: errorMsg });
+      return;
     }
+
+    const incomingRange = message.payload?.range;
+    const range: ExportRangeRequest = incomingRange ?? {
+      startChapter: 0,
+      endChapter: 0,
+      label: message.payload?.bookTitle || 'Bab Aktif',
+      bookTitle: message.payload?.bookTitle || 'BMP_UT',
+      savePerPageDebug: false
+    };
+
+    if (range.startChapter < 0 || range.endChapter < range.startChapter) {
+      sendResponse({
+        success: false,
+        error: `Rentang chapter tidak valid (${range.startChapter} s.d. ${range.endChapter}).`
+      });
+      return;
+    }
+
+    // Reset progress to INITIALIZING synchronously before acknowledging start
+    // so widget polling never reads stale COMPLETED/STOPPED/ERROR from a previous session.
+    this.updateProgress({
+      status: 'INITIALIZING',
+      currentChapter: 0,
+      currentChapterIndex: range.startChapter,
+      totalChaptersEstimated: range.endChapter - range.startChapter + 1,
+      chapterTitle: range.label,
+      message: `Memulai navigasi otomatis untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`,
+      percent: 0,
+      capturedCount: 0,
+      totalBytes: 0
+    });
+
+    // Acknowledge start immediately so long-running batches never hit sendMessage IPC timeouts;
+    // live updates are delivered via GET_STATUS polling + EXPORT_COMPLETE/EXPORT_ERROR push notifications.
+    sendResponse({
+      success: true,
+      message: `Memulai navigasi otomatis untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`
+    });
+
+    // Launch batch export asynchronously
+    this.orchestrator
+      .runBatchExport(tabId, range, message.payload?.config, {
+        onProgress: (progress) => this.updateProgress(progress),
+        savePdfFile: (tId, base64, filename) => this.savePdfFile(tId, base64, filename)
+      })
+      .then(async (summary) => {
+        logger.info('Batch export finished with summary:', {
+          status: summary.status,
+          captured: summary.capturedCount,
+          totalRequested: summary.totalRequested,
+          totalBytes: summary.totalBytes,
+          lastChapterIndex: summary.lastChapterIndex
+        });
+
+        try {
+          if (summary.status === 'ERROR') {
+            await chrome.tabs.sendMessage(tabId, {
+              type: 'EXPORT_ERROR',
+              payload: {
+                message: summary.errorMessage || 'Ekspor rentang halaman gagal.',
+                details: `Berhasil ${summary.capturedCount}/${summary.totalRequested} halaman.`
+              }
+            });
+          } else {
+            await chrome.tabs.sendMessage(tabId, {
+              type: 'EXPORT_COMPLETE',
+              payload: {
+                filename: range.label,
+                totalChapters: summary.capturedCount,
+                summary
+              }
+            });
+          }
+        } catch {
+          // Tab might have been closed
+        }
+      })
+      .catch((err) => {
+        logger.error('Unhandled error in orchestrator.runBatchExport:', err);
+      });
   }
 
   private async handleStopExport(
-    _message: Extract<ExtensionMessage, { type: 'STOP_EXPORT' }>,
+    message: Extract<ExtensionMessage, { type: 'STOP_EXPORT' }>,
     _sender: chrome.runtime.MessageSender,
     sendResponse: (response?: unknown) => void
   ): Promise<void> {
     logger.info('Stopping export session by user request.');
-    await this.debuggerManager.detach();
-    this.updateProgress({
-      status: 'STOPPED',
-      currentChapter: 0,
-      chapterTitle: 'Dihentikan',
-      message: 'Proses ekspor dihentikan oleh pengguna.'
-    });
-    sendResponse({ success: true, message: 'Export stopped.' });
+    await this.orchestrator.stop(message.reason || 'User manual stop', (progress) =>
+      this.updateProgress(progress)
+    );
+    if (!this.orchestrator.isRunning()) {
+      await this.debuggerManager.detach().catch(() => {});
+      this.updateProgress({
+        status: 'STOPPED',
+        currentChapter: 0,
+        chapterTitle: 'Dihentikan',
+        message: 'Proses ekspor dihentikan oleh pengguna.'
+      });
+    }
+    sendResponse({ success: true, message: 'Permintaan berhenti diterima.' });
   }
 
   /**
