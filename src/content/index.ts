@@ -1,12 +1,96 @@
 import { DomDetector } from './dom-detector';
 import { UiInjector } from './ui-injector';
 import { PrintStyler } from './print-styler';
+import { TocParser } from './toc-parser';
+import { PageNavigator } from './page-navigator';
 import { logger } from '../utils/logger';
 import type { ExtensionMessage } from '../types/messages';
 
 function setupMessageListeners(): void {
   chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
     switch (message.type) {
+      case 'GET_BOOK_STRUCTURE':
+        try {
+          const data = TocParser.getBookStructure();
+          sendResponse({ success: true, data });
+        } catch (err) {
+          logger.error('Error during GET_BOOK_STRUCTURE:', err);
+          sendResponse({ success: false, error: String(err) });
+        }
+        return false;
+
+      case 'ENSURE_SINGLE_PAGE_MODE':
+        (async () => {
+          try {
+            const res = await PageNavigator.getInstance().ensureSinglePageMode();
+            sendResponse(res);
+          } catch (err) {
+            logger.error('Error during ENSURE_SINGLE_PAGE_MODE:', err);
+            sendResponse({ success: false, wasSpreadMode: false, changed: false, message: String(err) });
+          }
+        })();
+        return true;
+
+      case 'RESTORE_PAGE_VIEW_MODE':
+        (async () => {
+          try {
+            const res = await PageNavigator.getInstance().restorePageViewMode();
+            sendResponse(res);
+          } catch (err) {
+            logger.error('Error during RESTORE_PAGE_VIEW_MODE:', err);
+            sendResponse({ success: false, restored: false });
+          }
+        })();
+        return true;
+
+      case 'NAVIGATE_TO_CHAPTER':
+        (async () => {
+          try {
+            const res = await PageNavigator.getInstance().navigateToChapter(message.payload);
+            sendResponse(res);
+          } catch (err) {
+            logger.error('Error during NAVIGATE_TO_CHAPTER:', err);
+            sendResponse({
+              success: false,
+              actualChapter: null,
+              chapterTitle: 'Error',
+              fingerprint: '',
+              error: String(err)
+            });
+          }
+        })();
+        return true;
+
+      case 'ABORT_NAVIGATION':
+        try {
+          PageNavigator.getInstance().abort();
+          sendResponse({ success: true });
+        } catch (err) {
+          logger.error('Error during ABORT_NAVIGATION:', err);
+          sendResponse({ success: false });
+        }
+        return false;
+
+      case 'EXPORT_COMPLETE':
+        try {
+          UiInjector.getInstance().getWidget()?.handleExportCompleteNotification(message.payload);
+          sendResponse({ success: true });
+        } catch (err) {
+          logger.warn('Error handling EXPORT_COMPLETE in widget:', err);
+          sendResponse({ success: false });
+        }
+        return false;
+
+      case 'EXPORT_ERROR':
+        try {
+          UiInjector.getInstance().getWidget()?.handleExportErrorNotification(message.payload);
+          sendResponse({ success: true });
+        } catch (err) {
+          logger.warn('Error handling EXPORT_ERROR in widget:', err);
+          sendResponse({ success: false });
+        }
+        return false;
+
       case 'PREPARE_FOR_PRINT':
         (async () => {
           try {

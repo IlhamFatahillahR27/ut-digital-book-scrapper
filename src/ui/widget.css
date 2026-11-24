@@ -119,6 +119,137 @@
   margin-top: 2px;
 }
 
+.rbv-range-panel {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rbv-range-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.rbv-refresh-btn {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  color: #475569;
+  border-radius: 5px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1.2;
+  transition: all 0.15s ease;
+}
+
+.rbv-refresh-btn:hover:not(:disabled) {
+  background: #e0f2fe;
+  border-color: #7dd3fc;
+  color: #0369a1;
+}
+
+.rbv-refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.rbv-select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #0f172a;
+  font-size: 12px;
+  font-family: inherit;
+  box-sizing: border-box;
+  outline: none;
+}
+
+.rbv-select:focus,
+.rbv-num-input:focus {
+  border-color: #0284c7;
+  box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.15);
+}
+
+.rbv-select:disabled,
+.rbv-num-input:disabled {
+  background: #f1f5f9;
+  color: #94a3b8;
+  cursor: not-allowed;
+}
+
+.rbv-range-inputs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rbv-input-group {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.rbv-input-label {
+  font-size: 10px;
+  color: #64748b;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.rbv-num-input {
+  width: 100%;
+  padding: 5px 6px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #0f172a;
+  font-size: 12px;
+  font-family: inherit;
+  box-sizing: border-box;
+  outline: none;
+}
+
+.rbv-range-sep {
+  color: #94a3b8;
+  font-weight: 600;
+  margin-top: 14px;
+}
+
+.rbv-page-pill {
+  margin-top: 14px;
+  background: #e0f2fe;
+  color: #0369a1;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 7px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.rbv-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #475569;
+  cursor: pointer;
+  user-select: none;
+}
+
+.rbv-checkbox-row input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
 .rbv-status-row {
   display: flex;
   align-items: flex-start;
