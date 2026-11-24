@@ -50,10 +50,13 @@ export interface ExportRangeRequest {
   label: string;
   bookId?: string | null;
   bookTitle?: string;
-  /** Debug option in Phase 3: download each captured chapter PDF individually */
+  bookAuthor?: string | null;
+  /** Debug option: also download each captured chapter PDF individually */
   savePerPageDebug?: boolean;
   /** Optional chapter title lookup map (chapterIndex -> title from TOC) */
   chapterTitles?: Record<number, string>;
+  /** Filtered TOC items within this export range for hierarchical PDF bookmarks */
+  tocItems?: TocItem[];
 }
 
 export interface CapturedChapterMeta {
@@ -78,6 +81,13 @@ export interface BatchExportSummary {
   lastChapterIndex: number | null;
   chapters: CapturedChapterMeta[];
   errorMessage?: string;
+  /** Phase 4 stitched PDF output details */
+  outputFilename?: string;
+  outputBytes?: number;
+  totalPdfPages?: number;
+  bookmarkCount?: number;
+  isPartial?: boolean;
+  downloadId?: number;
 }
 
 export interface ExportProgress {

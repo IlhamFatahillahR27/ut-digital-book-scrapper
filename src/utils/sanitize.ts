@@ -7,8 +7,8 @@ export function sanitizeFilename(title: string, defaultName = 'Buku_Materi_Pokok
     return `${defaultName}.pdf`;
   }
 
-  // Remove illegal characters
-  let clean = title.replace(/[\\/:*?"<>|]/g, '_');
+  // Normalize typographic dashes to ASCII hyphen and remove illegal characters
+  let clean = title.replace(/[–—]/g, '-').replace(/[\\/:*?"<>|]/g, '_');
 
   // Collapse multiple underscores or spaces
   clean = clean.replace(/[\s_]+/g, '_').trim();

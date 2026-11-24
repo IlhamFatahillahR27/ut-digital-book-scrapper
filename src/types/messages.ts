@@ -31,6 +31,13 @@ export type MessageType =
   | 'PREPARE_FOR_PRINT'
   | 'RESTORE_AFTER_PRINT'
   | 'DOWNLOAD_PDF_BLOB'
+  | 'DOWNLOAD_PDF_CHUNK_INIT'
+  | 'DOWNLOAD_PDF_CHUNK_APPEND'
+  | 'DOWNLOAD_PDF_CHUNK_FINALIZE'
+  | 'OFFSCREEN_BLOB_INIT'
+  | 'OFFSCREEN_BLOB_CHUNK'
+  | 'OFFSCREEN_BLOB_FINALIZE'
+  | 'OFFSCREEN_BLOB_REVOKE'
   | 'EXPORT_PROGRESS'
   | 'EXPORT_COMPLETE'
   | 'EXPORT_ERROR';
@@ -176,6 +183,63 @@ export interface DownloadPdfBlobMessage {
   };
 }
 
+export interface DownloadPdfChunkInitMessage {
+  type: 'DOWNLOAD_PDF_CHUNK_INIT';
+  payload: {
+    jobId: string;
+    filename: string;
+  };
+}
+
+export interface DownloadPdfChunkAppendMessage {
+  type: 'DOWNLOAD_PDF_CHUNK_APPEND';
+  payload: {
+    jobId: string;
+    base64Chunk: string;
+  };
+}
+
+export interface DownloadPdfChunkFinalizeMessage {
+  type: 'DOWNLOAD_PDF_CHUNK_FINALIZE';
+  payload: {
+    jobId: string;
+  };
+}
+
+export interface OffscreenBlobInitMessage {
+  type: 'OFFSCREEN_BLOB_INIT';
+  target: 'offscreen';
+  payload: {
+    jobId: string;
+    mimeType?: string;
+  };
+}
+
+export interface OffscreenBlobChunkMessage {
+  type: 'OFFSCREEN_BLOB_CHUNK';
+  target: 'offscreen';
+  payload: {
+    jobId: string;
+    base64Chunk: string;
+  };
+}
+
+export interface OffscreenBlobFinalizeMessage {
+  type: 'OFFSCREEN_BLOB_FINALIZE';
+  target: 'offscreen';
+  payload: {
+    jobId: string;
+  };
+}
+
+export interface OffscreenBlobRevokeMessage {
+  type: 'OFFSCREEN_BLOB_REVOKE';
+  target: 'offscreen';
+  payload: {
+    blobUrl: string;
+  };
+}
+
 export interface ExportProgressMessage {
   type: 'EXPORT_PROGRESS';
   payload: ExportProgress;
@@ -186,6 +250,10 @@ export interface ExportCompleteMessage {
   payload: {
     filename: string;
     totalChapters: number;
+    totalPdfPages?: number;
+    bookmarkCount?: number;
+    outputBytes?: number;
+    isPartial?: boolean;
     downloadId?: number;
     summary?: BatchExportSummary;
   };
@@ -197,6 +265,8 @@ export interface ExportErrorMessage {
     message: string;
     details?: string;
     recoverable?: boolean;
+    partialFilename?: string;
+    summary?: BatchExportSummary;
   };
 }
 
@@ -217,6 +287,13 @@ export type ExtensionMessage =
   | PrepareForPrintMessage
   | RestoreAfterPrintMessage
   | DownloadPdfBlobMessage
+  | DownloadPdfChunkInitMessage
+  | DownloadPdfChunkAppendMessage
+  | DownloadPdfChunkFinalizeMessage
+  | OffscreenBlobInitMessage
+  | OffscreenBlobChunkMessage
+  | OffscreenBlobFinalizeMessage
+  | OffscreenBlobRevokeMessage
   | ExportProgressMessage
   | ExportCompleteMessage
   | ExportErrorMessage;

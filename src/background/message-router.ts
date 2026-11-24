@@ -8,12 +8,16 @@ import { logger } from '../utils/logger';
 import { DebuggerManager } from './debugger-manager';
 import { CdpPrinter } from './cdp-printer';
 import { ExportOrchestrator } from './export-orchestrator';
+import { PdfAssembler } from './pdf-assembler';
+import { PdfDownloader } from './pdf-downloader';
 import { sanitizeFilename } from '../utils/sanitize';
 
 export class MessageRouter {
   private debuggerManager: DebuggerManager;
   private cdpPrinter: CdpPrinter;
   private orchestrator: ExportOrchestrator;
+  private pdfDownloader: PdfDownloader;
+  private isFinalizing = false;
   private currentProgress: ExportProgress = {
     status: 'IDLE',
     currentChapter: 0,
@@ -24,11 +28,13 @@ export class MessageRouter {
   constructor(
     debuggerManager: DebuggerManager,
     cdpPrinter: CdpPrinter,
-    orchestrator?: ExportOrchestrator
+    orchestrator?: ExportOrchestrator,
+    pdfDownloader?: PdfDownloader
   ) {
     this.debuggerManager = debuggerManager;
     this.cdpPrinter = cdpPrinter;
     this.orchestrator = orchestrator ?? new ExportOrchestrator(debuggerManager, cdpPrinter);
+    this.pdfDownloader = pdfDownloader ?? new PdfDownloader();
   }
 
   handleMessage(
@@ -191,7 +197,8 @@ export class MessageRouter {
   }
 
   /**
-   * Phase 3: Initiates multi-chapter module / page-range auto-navigation export session
+   * Phase 3 + Phase 4: Multi-chapter auto-navigation capture, incremental pdf-lib stitching,
+   * hierarchical bookmarks, and automatic download (including Stop & Save Partial).
    */
   private async handleStartExport(
     message: Extract<ExtensionMessage, { type: 'START_EXPORT' }>,
@@ -204,10 +211,10 @@ export class MessageRouter {
       return;
     }
 
-    if (this.orchestrator.isRunning()) {
+    if (this.orchestrator.isRunning() || this.isFinalizing) {
       sendResponse({
         success: false,
-        error: 'Sesi ekspor sedang berjalan. Klik Berhenti terlebih dahulu jika ingin membatalkan.'
+        error: 'Sesi ekspor atau penggabungan PDF sedang berjalan. Tunggu selesai atau klik Berhenti terlebih dahulu.'
       });
       return;
     }
@@ -229,6 +236,20 @@ export class MessageRouter {
       return;
     }
 
+    const bookTitle = range.bookTitle || message.payload?.bookTitle || 'BMP_UT';
+    const assembler = new PdfAssembler();
+    try {
+      await assembler.init({
+        bookTitle,
+        label: range.label,
+        author: range.bookAuthor
+      });
+    } catch (initErr) {
+      const msg = initErr instanceof Error ? initErr.message : String(initErr);
+      sendResponse({ success: false, error: `Gagal inisialisasi PDF Assembler: ${msg}` });
+      return;
+    }
+
     // Reset progress to INITIALIZING synchronously before acknowledging start
     // so widget polling never reads stale COMPLETED/STOPPED/ERROR from a previous session.
     this.updateProgress({
@@ -237,7 +258,7 @@ export class MessageRouter {
       currentChapterIndex: range.startChapter,
       totalChaptersEstimated: range.endChapter - range.startChapter + 1,
       chapterTitle: range.label,
-      message: `Memulai navigasi otomatis untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`,
+      message: `Memulai ekspor untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`,
       percent: 0,
       capturedCount: 0,
       totalBytes: 0
@@ -247,17 +268,21 @@ export class MessageRouter {
     // live updates are delivered via GET_STATUS polling + EXPORT_COMPLETE/EXPORT_ERROR push notifications.
     sendResponse({
       success: true,
-      message: `Memulai navigasi otomatis untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`
+      message: `Memulai ekspor untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`
     });
 
-    // Launch batch export asynchronously
+    // Launch batch export + incremental stitching asynchronously
     this.orchestrator
       .runBatchExport(tabId, range, message.payload?.config, {
         onProgress: (progress) => this.updateProgress(progress),
-        savePdfFile: (tId, base64, filename) => this.savePdfFile(tId, base64, filename)
+        savePdfFile: (tId, base64, filename) => this.savePdfFile(tId, base64, filename),
+        deferTerminalStatus: true,
+        onChapterCaptured: async (buffer, meta) => {
+          await assembler.appendChapter(buffer, meta);
+        }
       })
       .then(async (summary) => {
-        logger.info('Batch export finished with summary:', {
+        logger.info('Batch capture finished; entering Phase 4 finalization:', {
           status: summary.status,
           captured: summary.capturedCount,
           totalRequested: summary.totalRequested,
@@ -265,30 +290,200 @@ export class MessageRouter {
           lastChapterIndex: summary.lastChapterIndex
         });
 
+        this.isFinalizing = true;
         try {
-          if (summary.status === 'ERROR') {
-            await chrome.tabs.sendMessage(tabId, {
+          // Stitch & download merged PDF if >= 1 chapter was captured (including Stop & Error Partial Save)
+          if (summary.capturedCount > 0 && assembler.getTotalPages() > 0) {
+            const isPartial =
+              summary.status !== 'COMPLETED' || summary.capturedCount < summary.totalRequested;
+            summary.isPartial = isPartial;
+
+            this.updateProgress({
+              status: 'STITCHING',
+              currentChapter: summary.capturedCount,
+              currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
+              totalChaptersEstimated: summary.totalRequested,
+              chapterTitle: range.label,
+              message: isPartial
+                ? `Menyimpan PDF parsial (${summary.capturedCount} hal) & menyusun bookmarks...`
+                : `Menggabungkan ${summary.capturedCount} hal & menyusun bookmarks PDF...`,
+              percent: isPartial
+                ? Math.round((summary.capturedCount / summary.totalRequested) * 100)
+                : 99,
+              capturedCount: summary.capturedCount,
+              totalBytes: summary.totalBytes
+            });
+
+            const assembled = await assembler.finalize(range.tocItems, { isPartial });
+
+            const rawName = isPartial
+              ? `${bookTitle}_${range.label}_Partial_ch${summary.startChapter}-${summary.lastChapterIndex ?? summary.startChapter}`
+              : `${bookTitle}_${range.label}`;
+            const outputFilename = sanitizeFilename(rawName);
+            const sizeMb = (assembled.bytes.byteLength / 1024 / 1024).toFixed(2);
+
+            this.updateProgress({
+              status: 'STITCHING',
+              currentChapter: summary.capturedCount,
+              currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
+              totalChaptersEstimated: summary.totalRequested,
+              chapterTitle: range.label,
+              message: `Mengunduh ${outputFilename} (${sizeMb} MB, ${assembled.bookmarkCount} bookmarks)...`,
+              percent: 99,
+              capturedCount: summary.capturedCount,
+              totalBytes: assembled.bytes.byteLength
+            });
+
+            const dlResult = await this.pdfDownloader.downloadBytes(
+              tabId,
+              assembled.bytes,
+              outputFilename
+            );
+
+            summary.outputFilename = outputFilename;
+            summary.outputBytes = assembled.bytes.byteLength;
+            summary.totalPdfPages = assembled.totalPages;
+            summary.bookmarkCount = assembled.bookmarkCount;
+            summary.downloadId = dlResult.downloadId;
+
+            if (summary.status === 'COMPLETED') {
+              this.updateProgress({
+                status: 'COMPLETED',
+                currentChapter: summary.capturedCount,
+                currentChapterIndex: summary.lastChapterIndex ?? summary.endChapter,
+                totalChaptersEstimated: summary.totalRequested,
+                chapterTitle: range.label,
+                message: `Selesai! ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB, ${assembled.bookmarkCount} bookmarks) diunduh.`,
+                percent: 100,
+                capturedCount: summary.capturedCount,
+                totalBytes: assembled.bytes.byteLength
+              });
+
+              await chrome.tabs
+                .sendMessage(tabId, {
+                  type: 'EXPORT_COMPLETE',
+                  payload: {
+                    filename: outputFilename,
+                    totalChapters: summary.capturedCount,
+                    totalPdfPages: assembled.totalPages,
+                    bookmarkCount: assembled.bookmarkCount,
+                    outputBytes: assembled.bytes.byteLength,
+                    isPartial: false,
+                    downloadId: dlResult.downloadId,
+                    summary
+                  }
+                })
+                .catch(() => {});
+            } else if (summary.status === 'STOPPED') {
+              this.updateProgress({
+                status: 'STOPPED',
+                currentChapter: summary.capturedCount,
+                currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
+                totalChaptersEstimated: summary.totalRequested,
+                chapterTitle: 'Dihentikan (Parsial Tersimpan)',
+                message: `Dihentikan. PDF parsial disimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB, ${assembled.bookmarkCount} bookmarks).`,
+                percent: Math.round((summary.capturedCount / summary.totalRequested) * 100),
+                capturedCount: summary.capturedCount,
+                totalBytes: assembled.bytes.byteLength
+              });
+
+              await chrome.tabs
+                .sendMessage(tabId, {
+                  type: 'EXPORT_COMPLETE',
+                  payload: {
+                    filename: outputFilename,
+                    totalChapters: summary.capturedCount,
+                    totalPdfPages: assembled.totalPages,
+                    bookmarkCount: assembled.bookmarkCount,
+                    outputBytes: assembled.bytes.byteLength,
+                    isPartial: true,
+                    downloadId: dlResult.downloadId,
+                    summary
+                  }
+                })
+                .catch(() => {});
+            } else {
+              // ERROR mid-batch, but partial PDF was rescued and saved!
+              this.updateProgress({
+                status: 'ERROR',
+                currentChapter: summary.capturedCount,
+                currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
+                totalChaptersEstimated: summary.totalRequested,
+                chapterTitle: 'Error (Parsial Tersimpan)',
+                message: `Terhenti karena error, namun PDF parsial tersimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB).`,
+                percent: Math.round((summary.capturedCount / summary.totalRequested) * 100),
+                capturedCount: summary.capturedCount,
+                totalBytes: assembled.bytes.byteLength
+              });
+
+              await chrome.tabs
+                .sendMessage(tabId, {
+                  type: 'EXPORT_ERROR',
+                  payload: {
+                    message: summary.errorMessage || 'Ekspor terhenti di tengah proses.',
+                    details: `PDF parsial tersimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB).`,
+                    partialFilename: outputFilename,
+                    summary
+                  }
+                })
+                .catch(() => {});
+            }
+          } else {
+            // 0 chapters captured — emit terminal error/stopped without creating empty PDF
+            if (summary.status === 'ERROR') {
+              await chrome.tabs
+                .sendMessage(tabId, {
+                  type: 'EXPORT_ERROR',
+                  payload: {
+                    message: summary.errorMessage || 'Ekspor rentang halaman gagal.',
+                    details: '0 halaman berhasil ditangkap.',
+                    summary
+                  }
+                })
+                .catch(() => {});
+            } else {
+              await chrome.tabs
+                .sendMessage(tabId, {
+                  type: 'EXPORT_COMPLETE',
+                  payload: {
+                    filename: range.label,
+                    totalChapters: 0,
+                    isPartial: true,
+                    summary
+                  }
+                })
+                .catch(() => {});
+            }
+          }
+        } catch (stitchErr) {
+          const errMsg = stitchErr instanceof Error ? stitchErr.message : String(stitchErr);
+          logger.error('Error during Phase 4 PDF stitching/download:', stitchErr);
+          this.updateProgress({
+            status: 'ERROR',
+            currentChapter: summary.capturedCount,
+            currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
+            totalChaptersEstimated: summary.totalRequested,
+            chapterTitle: 'Error Stitching',
+            message: `Gagal menggabungkan/mengunduh PDF: ${errMsg}`
+          });
+
+          await chrome.tabs
+            .sendMessage(tabId, {
               type: 'EXPORT_ERROR',
               payload: {
-                message: summary.errorMessage || 'Ekspor rentang halaman gagal.',
-                details: `Berhasil ${summary.capturedCount}/${summary.totalRequested} halaman.`
+                message: `Gagal menggabungkan/mengunduh PDF: ${errMsg}`,
+                details: `${summary.capturedCount} halaman telah ditangkap sebelum gagal.`
               }
-            });
-          } else {
-            await chrome.tabs.sendMessage(tabId, {
-              type: 'EXPORT_COMPLETE',
-              payload: {
-                filename: range.label,
-                totalChapters: summary.capturedCount,
-                summary
-              }
-            });
-          }
-        } catch {
-          // Tab might have been closed
+            })
+            .catch(() => {});
+        } finally {
+          assembler.dispose();
+          this.isFinalizing = false;
         }
       })
       .catch((err) => {
+        assembler.dispose();
+        this.isFinalizing = false;
         logger.error('Unhandled error in orchestrator.runBatchExport:', err);
       });
   }
@@ -302,7 +497,7 @@ export class MessageRouter {
     await this.orchestrator.stop(message.reason || 'User manual stop', (progress) =>
       this.updateProgress(progress)
     );
-    if (!this.orchestrator.isRunning()) {
+    if (!this.orchestrator.isRunning() && !this.isFinalizing) {
       await this.debuggerManager.detach().catch(() => {});
       this.updateProgress({
         status: 'STOPPED',
