@@ -25,15 +25,15 @@ export class UiInjector {
       this.rootElement = document.createElement(ROOT_ELEMENT_ID);
       this.rootElement.id = ROOT_ELEMENT_ID;
       this.rootElement.style.cssText = `
-        position: fixed !important;
-        top: 80px !important;
-        right: 24px !important;
-        z-index: 2147483647 !important;
-        display: block !important;
-        width: auto !important;
-        pointer-events: auto !important;
-        margin: 0 !important;
-        padding: 0 !important;
+        position: fixed;
+        top: 80px;
+        right: 24px;
+        z-index: 2147483647;
+        display: block;
+        width: auto;
+        pointer-events: auto;
+        margin: 0;
+        padding: 0;
       `;
       
       const shadowRoot = this.rootElement.attachShadow({ mode: 'open' });

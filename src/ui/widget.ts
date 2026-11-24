@@ -109,6 +109,8 @@ export class FloatingWidget {
         return;
       }
 
+      e.preventDefault();
+
       isDragging = true;
       startX = e.clientX;
       startY = e.clientY;
@@ -118,10 +120,10 @@ export class FloatingWidget {
       initialTop = rect.top;
 
       // Unset bottom/right and lock to left/top for absolute dragging
-      host.style.right = 'auto';
-      host.style.bottom = 'auto';
-      host.style.left = `${initialLeft}px`;
-      host.style.top = `${initialTop}px`;
+      host.style.setProperty('right', 'auto', 'important');
+      host.style.setProperty('bottom', 'auto', 'important');
+      host.style.setProperty('left', `${initialLeft}px`, 'important');
+      host.style.setProperty('top', `${initialTop}px`, 'important');
 
       const onMouseMove = (moveEvent: MouseEvent) => {
         if (!isDragging) return;
@@ -132,11 +134,14 @@ export class FloatingWidget {
         let newTop = initialTop + deltaY;
 
         // Keep inside screen boundaries
-        newLeft = Math.max(10, Math.min(window.innerWidth - host.offsetWidth - 10, newLeft));
-        newTop = Math.max(10, Math.min(window.innerHeight - host.offsetHeight - 10, newTop));
+        const maxLeft = Math.max(0, window.innerWidth - host.offsetWidth - 10);
+        const maxTop = Math.max(0, window.innerHeight - host.offsetHeight - 10);
 
-        host.style.left = `${newLeft}px`;
-        host.style.top = `${newTop}px`;
+        newLeft = Math.max(10, Math.min(maxLeft, newLeft));
+        newTop = Math.max(10, Math.min(maxTop, newTop));
+
+        host.style.setProperty('left', `${newLeft}px`, 'important');
+        host.style.setProperty('top', `${newTop}px`, 'important');
       };
 
       const onMouseUp = () => {
