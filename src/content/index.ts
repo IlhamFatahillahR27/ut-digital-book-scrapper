@@ -6,7 +6,21 @@ import { PageNavigator } from './page-navigator';
 import { logger } from '../utils/logger';
 import type { ExtensionMessage } from '../types/messages';
 
+const INIT_GUARD_KEY = '__RBV_UT_EXPORTER_LOADED__';
 const chunkDownloadJobs = new Map<string, { filename: string; parts: BlobPart[] }>();
+
+function detectSsoLoginPage(): boolean {
+  const urlLower = window.location.href.toLowerCase();
+  if (
+    /\/(login|signin|sign-in|auth|sso)\b/.test(urlLower) &&
+    !urlLower.includes('/reader/chapter/')
+  ) {
+    return true;
+  }
+  const hasPasswordInput = !!document.querySelector('input[type="password"]');
+  const hasReader = DomDetector.isKotobeeReader();
+  return hasPasswordInput && !hasReader;
+}
 
 function base64ToUint8(base64: string): Uint8Array {
   const binary = atob(base64);
@@ -79,6 +93,49 @@ function setupMessageListeners(): void {
           sendResponse({ success: true });
         } catch (err) {
           logger.error('Error during ABORT_NAVIGATION:', err);
+          sendResponse({ success: false });
+        }
+        return false;
+
+      case 'CHECK_PAGE_HEALTH':
+        try {
+          sendResponse({
+            online: typeof navigator !== 'undefined' ? navigator.onLine : true,
+            isLoginPage: detectSsoLoginPage(),
+            isKotobeeReader: DomDetector.isKotobeeReader(),
+            currentHash: window.location.hash
+          });
+        } catch {
+          sendResponse({
+            online: true,
+            isLoginPage: false,
+            isKotobeeReader: true,
+            currentHash: window.location.hash
+          });
+        }
+        return false;
+
+      case 'TOGGLE_WIDGET':
+        try {
+          const injector = UiInjector.getInstance();
+          if (!document.getElementById('rbv-ut-exporter-root')) {
+            injector.inject();
+          }
+          injector.ensureVisibleInViewport();
+          injector.getWidget()?.toggleVisibilityOrExpand();
+          sendResponse({ success: true });
+        } catch (err) {
+          logger.warn('Error handling TOGGLE_WIDGET:', err);
+          sendResponse({ success: false });
+        }
+        return false;
+
+      case 'EXPORT_PROGRESS':
+        try {
+          UiInjector.getInstance().getWidget()?.handleExportProgressNotification(message.payload);
+          sendResponse({ success: true });
+        } catch (err) {
+          logger.warn('Error handling EXPORT_PROGRESS in widget:', err);
           sendResponse({ success: false });
         }
         return false;
@@ -243,6 +300,20 @@ function initContentScript(): void {
     logger.debug('Skipping content script in sub-frame:', window.location.href);
     return;
   }
+
+  // Idempotent guard: prevent duplicate listener registration on manual toolbar re-injection
+  const winRecord = window as unknown as Record<string, unknown>;
+  if (winRecord[INIT_GUARD_KEY]) {
+    logger.debug('Content script already initialized; toggling existing widget.');
+    const injector = UiInjector.getInstance();
+    if (!document.getElementById('rbv-ut-exporter-root')) {
+      injector.inject();
+    }
+    injector.ensureVisibleInViewport();
+    injector.getWidget()?.toggleVisibilityOrExpand();
+    return;
+  }
+  winRecord[INIT_GUARD_KEY] = true;
 
   // Highlighted log in DevTools Console
   console.log(

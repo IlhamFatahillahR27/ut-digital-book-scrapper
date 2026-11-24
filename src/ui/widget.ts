@@ -2,10 +2,13 @@ import widgetCss from './widget.css?inline';
 import { DomDetector } from '../content/dom-detector';
 import { TocParser } from '../content/toc-parser';
 import { logger } from '../utils/logger';
-import type {
-  BookStructureInfo,
-  BatchExportSummary,
-  ModuleRange
+import { loadWidgetPreferences, saveWidgetPreferences } from '../utils/storage';
+import {
+  DEFAULT_EXPORTER_CONFIG,
+  type BookStructureInfo,
+  type BatchExportSummary,
+  type ExportProgress,
+  type ModuleRange
 } from '../types/exporter';
 import type {
   ExportCompleteMessage,
@@ -16,16 +19,26 @@ import type {
   StatusResponseMessage
 } from '../types/messages';
 
+const LARGE_RANGE_ADVISORY_THRESHOLD = 100;
+
 export class FloatingWidget {
   private shadowRoot: ShadowRoot;
   private isExporting = false;
   private isMinimized = false;
   private currentTitle = '';
   private pollIntervalId: number | null = null;
+  private keepAlivePort: chrome.runtime.Port | null = null;
   private bookStructure: BookStructureInfo | null = null;
+  private pendingResumeChapter: number | null = null;
+  private appVersion = '1.0.0';
 
   constructor(shadowRoot: ShadowRoot) {
     this.shadowRoot = shadowRoot;
+    try {
+      this.appVersion = chrome.runtime.getManifest?.().version || '1.0.0';
+    } catch {
+      this.appVersion = '1.0.0';
+    }
     this.init();
   }
 
@@ -35,6 +48,8 @@ export class FloatingWidget {
     this.bindEvents();
     this.setupDraggable();
     this.refreshBookStructure(true);
+    void this.restorePreferences();
+    void this.rehydrateActiveExportStatus();
 
     // Re-scan TOC shortly after initial mount in case Kotobee SPA finishes hydrating asynchronously
     window.setTimeout(() => {
@@ -62,8 +77,12 @@ export class FloatingWidget {
             <span>RBV-UT Exporter</span>
           </div>
           <div class="rbv-header-actions">
+            <span class="rbv-header-pct" id="rbv-header-pct">0%</span>
             <span class="rbv-badge">MV3</span>
             <button class="rbv-icon-btn" id="rbv-btn-toggle" title="Perkecil / Perbesar panel">−</button>
+          </div>
+          <div class="rbv-mini-progress">
+            <div class="rbv-mini-progress-fill" id="rbv-mini-progress-fill"></div>
           </div>
         </div>
         <div class="rbv-body">
@@ -94,16 +113,38 @@ export class FloatingWidget {
               </div>
               <span class="rbv-page-pill" id="rbv-page-count-pill">1 hal</span>
             </div>
-            <label class="rbv-checkbox-row" title="Selain menghasilkan 1 PDF gabungan ber-bookmark, simpan juga salinan PDF terpisah untuk setiap halaman">
-              <input type="checkbox" id="rbv-chk-save-per-page" />
-              <span>Simpan salinan PDF per halaman (Debug)</span>
-            </label>
+            <div class="rbv-advisory-tip" id="rbv-advisory-tip">
+              💡 Tip: Untuk buku &gt;${LARGE_RANGE_ADVISORY_THRESHOLD} halaman, mengekspor per Modul lebih cepat &amp; lebih hemat memori.
+            </div>
+          </div>
+
+          <div class="rbv-progress-card" id="rbv-progress-card">
+            <div class="rbv-progress-top">
+              <span class="rbv-phase-badge" id="rbv-phase-badge">Siap</span>
+              <span class="rbv-progress-pct" id="rbv-progress-pct">0%</span>
+            </div>
+            <div class="rbv-progress-track">
+              <div class="rbv-progress-fill" id="rbv-progress-fill"></div>
+            </div>
+            <div class="rbv-progress-headline" id="rbv-progress-headline">Menyiapkan ekspor...</div>
+            <div class="rbv-progress-sub" id="rbv-progress-sub"></div>
+            <div class="rbv-telemetry-row">
+              <span id="rbv-telemetry-left">0.00 MB</span>
+              <span class="rbv-skip-pill" id="rbv-skip-pill">⚠ 0 dilewati</span>
+              <span id="rbv-telemetry-right">Estimasi: —</span>
+            </div>
+          </div>
+
+          <div class="rbv-resume-banner" id="rbv-resume-banner">
+            <div id="rbv-resume-text">Ekspor terhenti di tengah proses.</div>
+            <button class="rbv-btn-resume" id="rbv-btn-resume">▶ Lanjutkan dari Ch 0</button>
           </div>
 
           <div class="rbv-status-row">
             <span class="rbv-status-dot" id="rbv-status-dot"></span>
             <span id="rbv-status-text">Siap. Pilih modul atau rentang chapter di atas.</span>
           </div>
+
           <div class="rbv-actions">
             <button class="rbv-btn rbv-btn-primary" id="rbv-btn-start" title="Ekspor rentang terpilih menjadi 1 file PDF utuh dengan Bookmarks/Daftar Isi">
               🚀 Ekspor ke 1 File PDF
@@ -111,16 +152,39 @@ export class FloatingWidget {
             <button class="rbv-btn rbv-btn-danger" id="rbv-btn-stop" style="display: none;">
               ⏹ Berhenti &amp; Simpan Parsial
             </button>
-            <button class="rbv-btn rbv-btn-secondary" id="rbv-btn-test-print" title="Cetak bab aktif saja untuk menguji format & kelengkapan halaman">
-              📄 Uji Cetak 1 Bab (Fase 2)
-            </button>
-            <button class="rbv-btn rbv-btn-outline" id="rbv-btn-diag" title="Salin struktur DOM Kotobee ke clipboard untuk analisis jika layout bermasalah">
-              🔍 Salin Diagnostik DOM
+            <button class="rbv-btn rbv-btn-secondary" id="rbv-btn-test-print" title="Cetak halaman yang sedang Anda buka saat ini menjadi 1 file PDF">
+              📄 Cetak Halaman Aktif
             </button>
           </div>
+
+          <details class="rbv-advanced" id="rbv-advanced-drawer">
+            <summary class="rbv-advanced-summary">
+              <span>⚙ Alat Lanjutan &amp; Diagnostik</span>
+              <span class="rbv-advanced-caret">▼</span>
+            </summary>
+            <div class="rbv-advanced-body">
+              <div class="rbv-adv-grid">
+                <div class="rbv-input-group">
+                  <span class="rbv-input-label">Maks Retry / hal</span>
+                  <input type="number" min="0" max="4" value="${DEFAULT_EXPORTER_CONFIG.maxRetriesPerChapter}" class="rbv-num-input" id="rbv-adv-retries" />
+                </div>
+                <div class="rbv-input-group">
+                  <span class="rbv-input-label">Timeout (dtk)</span>
+                  <input type="number" min="10" max="60" value="${Math.round(DEFAULT_EXPORTER_CONFIG.chapterNavigationTimeoutMs / 1000)}" class="rbv-num-input" id="rbv-adv-timeout" />
+                </div>
+              </div>
+              <label class="rbv-checkbox-row" title="Selain menghasilkan 1 PDF gabungan ber-bookmark, simpan juga salinan PDF terpisah untuk setiap halaman">
+                <input type="checkbox" id="rbv-chk-save-per-page" />
+                <span>Simpan salinan PDF per halaman (Debug)</span>
+              </label>
+              <button class="rbv-btn rbv-btn-outline" id="rbv-btn-diag" title="Salin struktur DOM & TOC Kotobee ke clipboard untuk analisis">
+                🔍 Salin Diagnostik DOM
+              </button>
+            </div>
+          </details>
         </div>
         <div class="rbv-footer">
-          Optimized for NotebookLM • v0.3.0 (Fase 4)
+          Optimized for NotebookLM • v${this.escapeHtml(this.appVersion)}
         </div>
       </div>
     `;
@@ -133,24 +197,123 @@ export class FloatingWidget {
     const toggleBtn = this.shadowRoot.querySelector('#rbv-btn-toggle') as HTMLButtonElement | null;
     const diagBtn = this.shadowRoot.querySelector('#rbv-btn-diag') as HTMLButtonElement | null;
     const refreshTocBtn = this.shadowRoot.querySelector('#rbv-btn-refresh-toc') as HTMLButtonElement | null;
+    const resumeBtn = this.shadowRoot.querySelector('#rbv-btn-resume') as HTMLButtonElement | null;
     const moduleSelect = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
+    const saveChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
+    const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
+    const timeoutInput = this.shadowRoot.querySelector('#rbv-adv-timeout') as HTMLInputElement | null;
 
     testPrintBtn?.addEventListener('click', () => this.handleTestPrint());
     startBtn?.addEventListener('click', () => this.handleStart());
     stopBtn?.addEventListener('click', () => this.handleStop());
     diagBtn?.addEventListener('click', () => this.handleCopyDiagnostics());
     refreshTocBtn?.addEventListener('click', () => this.refreshBookStructure(false));
+    resumeBtn?.addEventListener('click', () => this.handleApplyResume());
 
     moduleSelect?.addEventListener('change', () => this.handleModuleSelectionChange());
     startInput?.addEventListener('input', () => this.handleManualRangeEdit());
     endInput?.addEventListener('input', () => this.handleManualRangeEdit());
 
+    saveChk?.addEventListener('change', () => {
+      void saveWidgetPreferences({ savePerPageDebug: !!saveChk.checked });
+    });
+    retriesInput?.addEventListener('change', () => {
+      const val = this.clampInt(retriesInput.value, 0, 4, DEFAULT_EXPORTER_CONFIG.maxRetriesPerChapter);
+      retriesInput.value = String(val);
+      void saveWidgetPreferences({ maxRetriesPerChapter: val });
+    });
+    timeoutInput?.addEventListener('change', () => {
+      const sec = this.clampInt(timeoutInput.value, 10, 60, 20);
+      timeoutInput.value = String(sec);
+      void saveWidgetPreferences({ chapterNavigationTimeoutMs: sec * 1000 });
+    });
+
     toggleBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
       this.toggleMinimize();
     });
+  }
+
+  /**
+   * Restores saved widget position, minimized state, and advanced settings from chrome.storage.local
+   */
+  private async restorePreferences(): Promise<void> {
+    const prefs = await loadWidgetPreferences();
+    const host = this.shadowRoot.host as HTMLElement | null;
+
+    if (host && typeof prefs.left === 'number' && typeof prefs.top === 'number') {
+      const maxLeft = Math.max(10, window.innerWidth - 340);
+      const maxTop = Math.max(10, window.innerHeight - 80);
+      const clampedLeft = Math.max(10, Math.min(maxLeft, prefs.left));
+      const clampedTop = Math.max(10, Math.min(maxTop, prefs.top));
+      host.style.setProperty('right', 'auto', 'important');
+      host.style.setProperty('bottom', 'auto', 'important');
+      host.style.setProperty('left', `${clampedLeft}px`, 'important');
+      host.style.setProperty('top', `${clampedTop}px`, 'important');
+    }
+
+    if (typeof prefs.minimized === 'boolean' && prefs.minimized !== this.isMinimized) {
+      this.setMinimized(prefs.minimized, false);
+    }
+
+    const saveChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
+    if (saveChk && typeof prefs.savePerPageDebug === 'boolean') {
+      saveChk.checked = prefs.savePerPageDebug;
+    }
+
+    const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
+    if (retriesInput && typeof prefs.maxRetriesPerChapter === 'number') {
+      retriesInput.value = String(
+        this.clampInt(prefs.maxRetriesPerChapter, 0, 4, DEFAULT_EXPORTER_CONFIG.maxRetriesPerChapter)
+      );
+    }
+
+    const timeoutInput = this.shadowRoot.querySelector('#rbv-adv-timeout') as HTMLInputElement | null;
+    if (timeoutInput && typeof prefs.chapterNavigationTimeoutMs === 'number') {
+      const sec = this.clampInt(Math.round(prefs.chapterNavigationTimeoutMs / 1000), 10, 60, 20);
+      timeoutInput.value = String(sec);
+    }
+  }
+
+  /**
+   * Rehydrates live progress if widget was re-mounted during an already active export
+   */
+  private async rehydrateActiveExportStatus(): Promise<void> {
+    try {
+      const res = (await chrome.runtime.sendMessage({ type: 'GET_STATUS' })) as StatusResponseMessage;
+      if (res?.type === 'STATUS_RESPONSE' && res.payload) {
+        const s = res.payload.status;
+        if (
+          s === 'INITIALIZING' ||
+          s === 'NAVIGATING' ||
+          s === 'CAPTURING_PAGE' ||
+          s === 'RETRYING' ||
+          s === 'WAITING_NEXT' ||
+          s === 'STITCHING'
+        ) {
+          this.isExporting = true;
+          this.setExportingVisualState(true);
+          this.openKeepAlivePort();
+          this.renderProgressCard(res.payload);
+          this.startProgressPolling();
+        }
+      }
+    } catch {
+      // Ignore transient startup IPC error
+    }
+  }
+
+  /**
+   * Called by content/index.ts when user clicks the browser extension toolbar icon
+   */
+  toggleVisibilityOrExpand(): void {
+    if (this.isMinimized) {
+      this.setMinimized(false, true);
+    } else {
+      this.setMinimized(true, true);
+    }
   }
 
   /**
@@ -195,7 +358,6 @@ export class FloatingWidget {
         customOpt.textContent = 'Rentang Manual (Custom)';
         selectEl.appendChild(customOpt);
 
-        // Auto-select the module containing the user's current reading chapter
         const activeModule = this.findModuleForChapter(structure.modules, structure.currentChapter);
         if (activeModule) {
           selectEl.value = activeModule.id;
@@ -212,7 +374,7 @@ export class FloatingWidget {
         if (!silent) {
           this.updateStatus(
             'idle',
-            `TOC terdeteksi: ${structure.modules.length - 1} bagian, total ${structure.totalChapters} halaman.`
+            `TOC terdeteksi: ${Math.max(1, structure.modules.length - 1)} bagian, total ${structure.totalChapters} halaman.`
           );
         }
       } else {
@@ -269,6 +431,7 @@ export class FloatingWidget {
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
     const pill = this.shadowRoot.querySelector('#rbv-page-count-pill') as HTMLElement | null;
+    const advisory = this.shadowRoot.querySelector('#rbv-advisory-tip') as HTMLElement | null;
     if (!startInput || !endInput || !pill) return;
 
     const start = parseInt(startInput.value, 10);
@@ -278,6 +441,7 @@ export class FloatingWidget {
       pill.textContent = 'Invalid';
       pill.style.background = '#fee2e2';
       pill.style.color = '#dc2626';
+      advisory?.classList.remove('visible');
       return;
     }
 
@@ -285,19 +449,31 @@ export class FloatingWidget {
     pill.textContent = `${count} hal`;
     pill.style.background = '#e0f2fe';
     pill.style.color = '#0369a1';
+
+    if (advisory) {
+      advisory.classList.toggle('visible', count > LARGE_RANGE_ADVISORY_THRESHOLD);
+    }
   }
 
   private toggleMinimize(): void {
+    this.setMinimized(!this.isMinimized, true);
+  }
+
+  private setMinimized(minimized: boolean, persist: boolean): void {
     const card = this.shadowRoot.querySelector('#rbv-card');
     const toggleBtn = this.shadowRoot.querySelector('#rbv-btn-toggle') as HTMLButtonElement | null;
 
-    this.isMinimized = !this.isMinimized;
+    this.isMinimized = minimized;
     if (this.isMinimized) {
       card?.classList.add('minimized');
       if (toggleBtn) toggleBtn.textContent = '+';
     } else {
       card?.classList.remove('minimized');
       if (toggleBtn) toggleBtn.textContent = '−';
+    }
+
+    if (persist) {
+      void saveWidgetPreferences({ minimized });
     }
   }
 
@@ -312,6 +488,8 @@ export class FloatingWidget {
     let startY = 0;
     let initialLeft = 0;
     let initialTop = 0;
+    let lastLeft = 0;
+    let lastTop = 0;
 
     header.addEventListener('mousedown', (e: MouseEvent) => {
       if ((e.target as HTMLElement).closest('.rbv-icon-btn')) {
@@ -327,6 +505,8 @@ export class FloatingWidget {
       const rect = host.getBoundingClientRect();
       initialLeft = rect.left;
       initialTop = rect.top;
+      lastLeft = initialLeft;
+      lastTop = initialTop;
 
       host.style.setProperty('right', 'auto', 'important');
       host.style.setProperty('bottom', 'auto', 'important');
@@ -347,6 +527,9 @@ export class FloatingWidget {
         newLeft = Math.max(10, Math.min(maxLeft, newLeft));
         newTop = Math.max(10, Math.min(maxTop, newTop));
 
+        lastLeft = newLeft;
+        lastTop = newTop;
+
         host.style.setProperty('left', `${newLeft}px`, 'important');
         host.style.setProperty('top', `${newTop}px`, 'important');
       };
@@ -355,6 +538,7 @@ export class FloatingWidget {
         isDragging = false;
         window.removeEventListener('mousemove', onMouseMove);
         window.removeEventListener('mouseup', onMouseUp);
+        void saveWidgetPreferences({ left: Math.round(lastLeft), top: Math.round(lastTop) });
       };
 
       window.addEventListener('mousemove', onMouseMove);
@@ -374,7 +558,7 @@ export class FloatingWidget {
       console.log('%c[RBV-UT Diagnostic Report]', 'color: #0284c7; font-weight: bold;', combined);
 
       await navigator.clipboard.writeText(json);
-      this.updateStatus('idle', '✅ Diagnostik DOM + TOC berhasil disalin ke clipboard!');
+      this.updateStatus('idle', '✅ Diagnostik DOM + TOC berhasil disalin ke clipboard.');
     } catch (err) {
       logger.error('Failed to copy diagnostics:', err);
       this.updateStatus('idle', 'Diagnostik dicetak di DevTools Console (F12).');
@@ -382,14 +566,25 @@ export class FloatingWidget {
   }
 
   /**
-   * Action: Phase 2 single chapter test print (preserved for regression testing)
+   * Action: Single active page clean PDF export
    */
   private async handleTestPrint(): Promise<void> {
     if (this.isExporting) return;
 
+    this.hideResumeBanner();
     this.isExporting = true;
-    this.toggleButtons(true);
-    this.updateStatus('busy', 'Menyiapkan uji coba cetak bab aktif...');
+    this.setExportingVisualState(true);
+    this.openKeepAlivePort();
+    this.renderProgressCard({
+      status: 'INITIALIZING',
+      currentChapter: 1,
+      totalChaptersEstimated: 1,
+      chapterTitle: DomDetector.detectChapterTitle(),
+      moduleLabel: 'Halaman Aktif',
+      phaseLabel: 'Inisialisasi',
+      percent: 10,
+      message: 'Menyiapkan cetak halaman aktif...'
+    });
     this.startProgressPolling();
 
     const chapterTitle = DomDetector.detectChapterTitle();
@@ -405,28 +600,42 @@ export class FloatingWidget {
 
     try {
       const response = await chrome.runtime.sendMessage(message);
-      logger.info('Test print response:', response);
+      logger.info('Single page print response:', response);
 
-      this.stopProgressPolling();
-      this.isExporting = false;
-      this.toggleButtons(false);
+      this.finishExportSession();
 
       if (response?.success) {
-        this.updateStatus('idle', `✅ Berhasil! File diunduh (${response.fileSizeMb || ''} MB).`);
+        this.renderProgressCard({
+          status: 'COMPLETED',
+          currentChapter: 1,
+          totalChaptersEstimated: 1,
+          chapterTitle,
+          moduleLabel: 'Halaman Aktif',
+          phaseLabel: 'Selesai',
+          percent: 100,
+          message: `✅ Berhasil! ${response.filename || 'PDF'} (${response.fileSizeMb || '0'} MB) diunduh.`
+        });
       } else {
-        this.updateStatus('error', `❌ Gagal: ${response?.error || 'Uji cetak gagal'}`);
+        this.renderProgressCard({
+          status: 'ERROR',
+          currentChapter: 0,
+          totalChaptersEstimated: 1,
+          chapterTitle,
+          moduleLabel: 'Halaman Aktif',
+          phaseLabel: 'Error',
+          percent: 0,
+          message: `❌ Gagal: ${response?.error || 'Cetak halaman aktif gagal.'}`
+        });
       }
     } catch (err) {
-      logger.error('Failed to execute test print:', err);
-      this.stopProgressPolling();
-      this.isExporting = false;
-      this.toggleButtons(false);
+      logger.error('Failed to execute single page print:', err);
+      this.finishExportSession();
       this.updateStatus('error', 'Gagal berkomunikasi dengan background service worker.');
     }
   }
 
   /**
-   * Action: Phase 3 multi-chapter module / page-range auto-navigation export
+   * Action: Multi-chapter module / page-range export into 1 stitched PDF with Bookmarks
    */
   private async handleStart(): Promise<void> {
     if (this.isExporting) return;
@@ -435,6 +644,8 @@ export class FloatingWidget {
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
     const selectEl = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
     const savePerPageChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
+    const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
+    const timeoutInput = this.shadowRoot.querySelector('#rbv-adv-timeout') as HTMLInputElement | null;
 
     const startChapter = parseInt(startInput?.value ?? '0', 10);
     const endChapter = parseInt(endInput?.value ?? '0', 10);
@@ -449,7 +660,6 @@ export class FloatingWidget {
     const selectedModule = structure.modules.find((m) => m.id === selectEl?.value);
     const label = selectedModule ? selectedModule.title : `Rentang Ch ${startChapter}–${endChapter}`;
 
-    // Build chapter title map & filtered hierarchical TOC entries for Phase 4 PDF Bookmarks
     const chapterTitles: Record<number, string> = {};
     for (const item of structure.tocItems) {
       chapterTitles[item.chapterIndex] = item.title;
@@ -462,14 +672,45 @@ export class FloatingWidget {
     const bookAuthor = DomDetector.detectBookAuthor();
     this.currentTitle = bookTitle;
 
+    const maxRetriesPerChapter = this.clampInt(
+      retriesInput?.value,
+      0,
+      4,
+      DEFAULT_EXPORTER_CONFIG.maxRetriesPerChapter
+    );
+    const navTimeoutSec = this.clampInt(
+      timeoutInput?.value,
+      10,
+      60,
+      Math.round(DEFAULT_EXPORTER_CONFIG.chapterNavigationTimeoutMs / 1000)
+    );
+
+    this.hideResumeBanner();
     this.isExporting = true;
-    this.toggleButtons(true);
-    this.updateStatus('busy', `Memulai ${label} (${endChapter - startChapter + 1} halaman)...`);
+    this.setExportingVisualState(true);
+    this.openKeepAlivePort();
+    this.renderProgressCard({
+      status: 'INITIALIZING',
+      currentChapter: 0,
+      totalChaptersEstimated: endChapter - startChapter + 1,
+      chapterTitle: label,
+      moduleLabel: label,
+      phaseLabel: 'Inisialisasi',
+      percent: 0,
+      totalBytes: 0,
+      failedCount: 0,
+      etaSeconds: null,
+      message: `Memulai ${label} (${endChapter - startChapter + 1} halaman)...`
+    });
 
     const message: StartExportMessage = {
       type: 'START_EXPORT',
       payload: {
         bookTitle,
+        config: {
+          maxRetriesPerChapter,
+          chapterNavigationTimeoutMs: navTimeoutSec * 1000
+        },
         range: {
           startChapter,
           endChapter,
@@ -491,22 +732,27 @@ export class FloatingWidget {
       if (response?.success) {
         this.startProgressPolling();
       } else {
-        this.stopProgressPolling();
-        this.isExporting = false;
-        this.toggleButtons(false);
-        this.updateStatus('error', `Error: ${response?.error || 'Gagal memulai ekspor'}`);
+        this.finishExportSession();
+        this.renderProgressCard({
+          status: 'ERROR',
+          currentChapter: 0,
+          totalChaptersEstimated: endChapter - startChapter + 1,
+          chapterTitle: label,
+          moduleLabel: label,
+          phaseLabel: 'Error',
+          percent: 0,
+          message: `Error: ${response?.error || 'Gagal memulai ekspor'}`
+        });
       }
     } catch (err) {
       logger.error('Failed to send START_EXPORT message:', err);
-      this.stopProgressPolling();
-      this.isExporting = false;
-      this.toggleButtons(false);
+      this.finishExportSession();
       this.updateStatus('error', 'Gagal berkomunikasi dengan background service worker.');
     }
   }
 
   private async handleStop(): Promise<void> {
-    this.updateStatus('busy', 'Mengirim sinyal berhenti...');
+    this.updateStatus('busy', 'Mengirim sinyal berhenti & menyelamatkan halaman...');
 
     const message: StopExportMessage = {
       type: 'STOP_EXPORT',
@@ -517,10 +763,37 @@ export class FloatingWidget {
       await chrome.runtime.sendMessage(message);
     } catch (err) {
       logger.error('Failed to send STOP_EXPORT message:', err);
-      this.stopProgressPolling();
-      this.isExporting = false;
-      this.toggleButtons(false);
+      this.finishExportSession();
       this.updateStatus('idle', 'Proses dihentikan.');
+    }
+  }
+
+  private handleApplyResume(): void {
+    if (this.pendingResumeChapter === null) return;
+
+    const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
+    const selectEl = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
+    if (startInput) {
+      startInput.value = String(this.pendingResumeChapter);
+    }
+    if (selectEl && selectEl.querySelector('option[value="custom"]')) {
+      selectEl.value = 'custom';
+    }
+    this.updatePageCountPill();
+    this.hideResumeBanner();
+    void this.handleStart();
+  }
+
+  /**
+   * Called by content/index.ts when Background pushes real-time EXPORT_PROGRESS
+   */
+  handleExportProgressNotification(progress: ExportProgress): void {
+    this.renderProgressCard(progress);
+
+    if (progress.status === 'COMPLETED' || progress.status === 'STOPPED' || progress.status === 'ERROR') {
+      if (this.isExporting) {
+        this.finishExportSession();
+      }
     }
   }
 
@@ -528,52 +801,229 @@ export class FloatingWidget {
    * Called by content/index.ts when Background pushes EXPORT_COMPLETE
    */
   handleExportCompleteNotification(payload: ExportCompleteMessage['payload']): void {
-    this.stopProgressPolling();
-    this.isExporting = false;
-    this.toggleButtons(false);
+    this.finishExportSession();
 
     const summary: BatchExportSummary | undefined = payload.summary;
     const filename = summary?.outputFilename || payload.filename;
     const outputBytes = summary?.outputBytes ?? payload.outputBytes ?? summary?.totalBytes ?? 0;
     const sizeMb = (outputBytes / 1024 / 1024).toFixed(2);
-    const pdfPages = summary?.totalPdfPages ?? payload.totalPdfPages ?? summary?.capturedCount ?? payload.totalChapters;
+    const pdfPages =
+      summary?.totalPdfPages ?? payload.totalPdfPages ?? summary?.capturedCount ?? payload.totalChapters;
     const bookmarks = summary?.bookmarkCount ?? payload.bookmarkCount ?? 0;
+    const failedCount = summary?.failedCount ?? 0;
+    const totalReq = summary?.totalRequested ?? pdfPages;
 
-    if (summary) {
-      if (summary.status === 'STOPPED') {
-        if (summary.outputFilename) {
-          this.updateStatus(
-            'idle',
-            `⏹ Dihentikan. PDF parsial diunduh: ${filename} (${pdfPages} hal, ${sizeMb} MB, ${bookmarks} bookmarks).`
-          );
-        } else {
-          this.updateStatus(
-            'idle',
-            `⏹ Dihentikan. ${summary.capturedCount}/${summary.totalRequested} hal selesai.`
-          );
-        }
-      } else {
-        this.updateStatus(
-          'idle',
-          `✅ Selesai! ${filename} (${pdfPages} hal, ${sizeMb} MB, ${bookmarks} bookmarks) diunduh.`
+    if (summary?.status === 'STOPPED') {
+      const pct = totalReq > 0 ? Math.round((summary.capturedCount / totalReq) * 100) : 0;
+      const msg = summary.outputFilename
+        ? `⏹ Dihentikan. PDF parsial diunduh: ${filename} (${pdfPages} hal, ${sizeMb} MB, ${bookmarks} bookmarks).`
+        : `⏹ Dihentikan. ${summary.capturedCount}/${totalReq} hal selesai.`;
+
+      this.renderProgressCard({
+        status: 'STOPPED',
+        currentChapter: summary.capturedCount,
+        totalChaptersEstimated: totalReq,
+        chapterTitle: filename,
+        moduleLabel: summary.label,
+        phaseLabel: 'Parsial',
+        percent: pct,
+        capturedCount: summary.capturedCount,
+        failedCount,
+        totalBytes: outputBytes,
+        etaSeconds: null,
+        message: msg
+      });
+
+      if (summary.resumeFromChapter !== null && summary.resumeFromChapter !== undefined) {
+        this.showResumeBanner(
+          summary.resumeFromChapter,
+          `Ekspor berhenti di ch/${summary.lastChapterIndex ?? summary.startChapter}. Anda bisa melanjutkan sisa halaman:`
         );
       }
-    } else {
-      this.updateStatus('idle', `✅ Selesai! ${filename} (${pdfPages} halaman) diunduh.`);
+      return;
     }
+
+    const skipInfo =
+      failedCount > 0 && summary?.failedChapters?.length
+        ? ` • ⚠ ${failedCount} hal dilewati (${summary.failedChapters.map((f) => `ch/${f.chapterIndex}`).join(', ')})`
+        : '';
+
+    this.renderProgressCard({
+      status: 'COMPLETED',
+      currentChapter: summary?.capturedCount ?? pdfPages,
+      totalChaptersEstimated: totalReq,
+      chapterTitle: filename,
+      moduleLabel: summary?.label,
+      phaseLabel: failedCount > 0 ? 'Selesai (Skip)' : 'Selesai',
+      percent: 100,
+      capturedCount: summary?.capturedCount ?? pdfPages,
+      failedCount,
+      totalBytes: outputBytes,
+      etaSeconds: 0,
+      message: `✅ Selesai! ${filename} (${pdfPages} hal, ${sizeMb} MB, ${bookmarks} bookmarks)${skipInfo}`
+    });
   }
 
   /**
    * Called by content/index.ts when Background pushes EXPORT_ERROR
    */
   handleExportErrorNotification(payload: ExportErrorMessage['payload']): void {
-    this.stopProgressPolling();
-    this.isExporting = false;
-    this.toggleButtons(false);
-    const suffix = payload.details ? ` (${payload.details})` : '';
-    this.updateStatus('error', `❌ ${payload.message}${suffix}`);
+    this.finishExportSession();
+
+    const summary = payload.summary;
+    const totalReq = summary?.totalRequested ?? 0;
+    const captured = summary?.capturedCount ?? 0;
+    const pct = totalReq > 0 ? Math.round((captured / totalReq) * 100) : 0;
+    const suffix = payload.details ? ` — ${payload.details}` : '';
+
+    this.renderProgressCard({
+      status: 'ERROR',
+      currentChapter: captured,
+      totalChaptersEstimated: totalReq || undefined,
+      chapterTitle: payload.partialFilename || summary?.label || 'Error',
+      moduleLabel: summary?.label,
+      phaseLabel: payload.partialFilename ? 'Error (Parsial)' : 'Error',
+      percent: pct,
+      capturedCount: captured,
+      failedCount: summary?.failedCount ?? 0,
+      totalBytes: summary?.outputBytes ?? summary?.totalBytes ?? 0,
+      etaSeconds: null,
+      message: `❌ ${payload.message}${suffix}`
+    });
+
+    if (summary && summary.resumeFromChapter !== null && summary.resumeFromChapter !== undefined) {
+      const reasonPrefix = summary.circuitBreakerTriggered
+        ? 'Circuit breaker aktif (3 gagal beruntun).'
+        : 'Ekspor terhenti karena error.';
+      this.showResumeBanner(
+        summary.resumeFromChapter,
+        `${reasonPrefix} ${payload.partialFilename ? 'PDF parsial sudah tersimpan.' : ''}`
+      );
+    }
   }
 
+  private renderProgressCard(progress: ExportProgress): void {
+    const card = this.shadowRoot.querySelector('#rbv-progress-card') as HTMLElement | null;
+    const phaseBadge = this.shadowRoot.querySelector('#rbv-phase-badge') as HTMLElement | null;
+    const pctEl = this.shadowRoot.querySelector('#rbv-progress-pct') as HTMLElement | null;
+    const fillEl = this.shadowRoot.querySelector('#rbv-progress-fill') as HTMLElement | null;
+    const headlineEl = this.shadowRoot.querySelector('#rbv-progress-headline') as HTMLElement | null;
+    const subEl = this.shadowRoot.querySelector('#rbv-progress-sub') as HTMLElement | null;
+    const leftEl = this.shadowRoot.querySelector('#rbv-telemetry-left') as HTMLElement | null;
+    const rightEl = this.shadowRoot.querySelector('#rbv-telemetry-right') as HTMLElement | null;
+    const skipPill = this.shadowRoot.querySelector('#rbv-skip-pill') as HTMLElement | null;
+    const headerPct = this.shadowRoot.querySelector('#rbv-header-pct') as HTMLElement | null;
+    const miniFill = this.shadowRoot.querySelector('#rbv-mini-progress-fill') as HTMLElement | null;
+
+    const pct = Math.max(0, Math.min(100, Math.round(progress.percent ?? 0)));
+
+    if (card) {
+      card.classList.add('visible');
+    }
+
+    if (pctEl) pctEl.textContent = `${pct}%`;
+    if (headerPct) headerPct.textContent = `${pct}%`;
+    if (miniFill) miniFill.style.width = `${pct}%`;
+
+    const isBusy =
+      progress.status === 'INITIALIZING' ||
+      progress.status === 'NAVIGATING' ||
+      progress.status === 'CAPTURING_PAGE' ||
+      progress.status === 'RETRYING' ||
+      progress.status === 'WAITING_NEXT' ||
+      progress.status === 'STITCHING';
+
+    if (fillEl) {
+      fillEl.style.width = `${pct}%`;
+      fillEl.className = 'rbv-progress-fill';
+      if (isBusy) fillEl.classList.add('animated');
+      if (progress.status === 'RETRYING') fillEl.classList.add('retrying');
+      else if (progress.status === 'STITCHING') fillEl.classList.add('stitching');
+      else if (progress.status === 'COMPLETED') fillEl.classList.add('success');
+      else if (progress.status === 'STOPPED') fillEl.classList.add('partial');
+      else if (progress.status === 'ERROR') fillEl.classList.add('error');
+    }
+
+    if (phaseBadge) {
+      phaseBadge.textContent = progress.phaseLabel || this.defaultPhaseLabel(progress.status);
+      phaseBadge.className = 'rbv-phase-badge';
+      if (progress.status === 'RETRYING') phaseBadge.classList.add('retrying');
+      else if (progress.status === 'STITCHING') phaseBadge.classList.add('stitching');
+      else if (progress.status === 'COMPLETED') phaseBadge.classList.add('success');
+      else if (progress.status === 'STOPPED') phaseBadge.classList.add('partial');
+      else if (progress.status === 'ERROR') phaseBadge.classList.add('error');
+    }
+
+    if (headlineEl) {
+      const total = progress.totalChaptersEstimated;
+      const modSuffix = progress.moduleLabel ? ` (${progress.moduleLabel})` : '';
+      if (total && total > 0 && progress.currentChapter > 0) {
+        headlineEl.textContent = `Halaman ${progress.currentChapter} dari ${total}${modSuffix}`;
+      } else if (progress.moduleLabel) {
+        headlineEl.textContent = progress.moduleLabel;
+      } else {
+        headlineEl.textContent = progress.chapterTitle || 'Memproses...';
+      }
+    }
+
+    if (subEl) {
+      subEl.textContent = progress.chapterTitle || '';
+    }
+
+    if (leftEl) {
+      const mb = ((progress.totalBytes ?? 0) / 1024 / 1024).toFixed(2);
+      leftEl.textContent = `${mb} MB`;
+    }
+
+    if (skipPill) {
+      const failed = progress.failedCount ?? 0;
+      if (failed > 0) {
+        skipPill.textContent = `⚠ ${failed} dilewati`;
+        skipPill.classList.add('visible');
+      } else {
+        skipPill.classList.remove('visible');
+      }
+    }
+
+    if (rightEl) {
+      if (progress.status === 'COMPLETED') {
+        rightEl.textContent = 'Selesai';
+      } else if (progress.status === 'STITCHING') {
+        rightEl.textContent = 'Menyusun PDF...';
+      } else if (typeof progress.etaSeconds === 'number' && progress.etaSeconds > 0) {
+        rightEl.textContent = `Sisa ~${this.formatDuration(progress.etaSeconds)}`;
+      } else if (isBusy) {
+        rightEl.textContent = 'Menghitung ETA...';
+      } else {
+        rightEl.textContent = '—';
+      }
+    }
+
+    const dotState: 'idle' | 'busy' | 'error' =
+      progress.status === 'ERROR' ? 'error' : isBusy ? 'busy' : 'idle';
+    this.updateStatus(dotState, progress.message);
+  }
+
+  private showResumeBanner(resumeFromChapter: number, description: string): void {
+    this.pendingResumeChapter = resumeFromChapter;
+    const banner = this.shadowRoot.querySelector('#rbv-resume-banner') as HTMLElement | null;
+    const text = this.shadowRoot.querySelector('#rbv-resume-text') as HTMLElement | null;
+    const btn = this.shadowRoot.querySelector('#rbv-btn-resume') as HTMLButtonElement | null;
+
+    if (text) text.textContent = description;
+    if (btn) btn.textContent = `▶ Lanjutkan dari Ch ${resumeFromChapter}`;
+    banner?.classList.add('visible');
+  }
+
+  private hideResumeBanner(): void {
+    this.pendingResumeChapter = null;
+    const banner = this.shadowRoot.querySelector('#rbv-resume-banner') as HTMLElement | null;
+    banner?.classList.remove('visible');
+  }
+
+  /**
+   * Lightweight 2s fallback safety poll in case a push notification is dropped during tab transitions
+   */
   private startProgressPolling(): void {
     if (this.pollIntervalId) return;
 
@@ -581,31 +1031,12 @@ export class FloatingWidget {
       try {
         const res = (await chrome.runtime.sendMessage({ type: 'GET_STATUS' })) as StatusResponseMessage;
         if (res?.type === 'STATUS_RESPONSE' && res.payload) {
-          const progress = res.payload;
-          if (progress.status === 'ERROR') {
-            this.updateStatus('error', progress.message);
-            if (this.isExporting) {
-              this.stopProgressPolling();
-              this.isExporting = false;
-              this.toggleButtons(false);
-            }
-          } else if (progress.status === 'COMPLETED' || progress.status === 'STOPPED') {
-            this.updateStatus('idle', progress.message);
-            if (this.isExporting) {
-              this.stopProgressPolling();
-              this.isExporting = false;
-              this.toggleButtons(false);
-            }
-          } else if (progress.status === 'IDLE') {
-            this.updateStatus('idle', progress.message);
-          } else {
-            this.updateStatus('busy', progress.message);
-          }
+          this.handleExportProgressNotification(res.payload);
         }
       } catch {
-        // Suppress polling error during transient tab transitions
+        // Suppress transient polling errors during tab transitions
       }
-    }, 800);
+    }, 2000);
   }
 
   private stopProgressPolling(): void {
@@ -613,6 +1044,35 @@ export class FloatingWidget {
       clearInterval(this.pollIntervalId);
       this.pollIntervalId = null;
     }
+  }
+
+  private openKeepAlivePort(): void {
+    if (this.keepAlivePort) return;
+    try {
+      this.keepAlivePort = chrome.runtime.connect({ name: 'rbv-export-keepalive' });
+      this.keepAlivePort.onDisconnect.addListener(() => {
+        this.keepAlivePort = null;
+      });
+    } catch {
+      this.keepAlivePort = null;
+    }
+  }
+
+  private closeKeepAlivePort(): void {
+    if (!this.keepAlivePort) return;
+    try {
+      this.keepAlivePort.disconnect();
+    } catch {
+      // Ignore already disconnected port
+    }
+    this.keepAlivePort = null;
+  }
+
+  private finishExportSession(): void {
+    this.stopProgressPolling();
+    this.closeKeepAlivePort();
+    this.isExporting = false;
+    this.setExportingVisualState(false);
   }
 
   private updateStatus(state: 'idle' | 'busy' | 'error', message: string): void {
@@ -630,7 +1090,10 @@ export class FloatingWidget {
     }
   }
 
-  private toggleButtons(exporting: boolean): void {
+  private setExportingVisualState(exporting: boolean): void {
+    const card = this.shadowRoot.querySelector('#rbv-card');
+    card?.classList.toggle('is-exporting', exporting);
+
     const testPrintBtn = this.shadowRoot.querySelector('#rbv-btn-test-print') as HTMLButtonElement | null;
     const startBtn = this.shadowRoot.querySelector('#rbv-btn-start') as HTMLButtonElement | null;
     const stopBtn = this.shadowRoot.querySelector('#rbv-btn-stop') as HTMLButtonElement | null;
@@ -640,6 +1103,8 @@ export class FloatingWidget {
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
     const saveChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
+    const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
+    const timeoutInput = this.shadowRoot.querySelector('#rbv-adv-timeout') as HTMLInputElement | null;
 
     if (testPrintBtn) testPrintBtn.disabled = exporting;
     if (diagBtn) diagBtn.disabled = exporting;
@@ -648,13 +1113,50 @@ export class FloatingWidget {
     if (startInput) startInput.disabled = exporting;
     if (endInput) endInput.disabled = exporting;
     if (saveChk) saveChk.disabled = exporting;
+    if (retriesInput) retriesInput.disabled = exporting;
+    if (timeoutInput) timeoutInput.disabled = exporting;
 
-    if (startBtn) {
-      startBtn.style.display = exporting ? 'none' : 'flex';
+    if (startBtn) startBtn.style.display = exporting ? 'none' : 'flex';
+    if (stopBtn) stopBtn.style.display = exporting ? 'flex' : 'none';
+  }
+
+  private defaultPhaseLabel(status: ExportProgress['status']): string {
+    switch (status) {
+      case 'INITIALIZING':
+        return 'Inisialisasi';
+      case 'NAVIGATING':
+        return 'Navigasi';
+      case 'CAPTURING_PAGE':
+        return 'Cetak PDF';
+      case 'RETRYING':
+        return 'Mengulang';
+      case 'WAITING_NEXT':
+        return 'Berikutnya';
+      case 'STITCHING':
+        return 'Menggabungkan';
+      case 'COMPLETED':
+        return 'Selesai';
+      case 'STOPPED':
+        return 'Parsial';
+      case 'ERROR':
+        return 'Error';
+      default:
+        return 'Siap';
     }
-    if (stopBtn) {
-      stopBtn.style.display = exporting ? 'flex' : 'none';
-    }
+  }
+
+  private formatDuration(totalSeconds: number): string {
+    const secs = Math.max(1, Math.round(totalSeconds));
+    if (secs < 60) return `${secs}d`;
+    const mins = Math.floor(secs / 60);
+    const rem = secs % 60;
+    return rem > 0 ? `${mins}m ${rem}d` : `${mins}m`;
+  }
+
+  private clampInt(raw: string | number | undefined, min: number, max: number, fallback: number): number {
+    const parsed = typeof raw === 'number' ? raw : parseInt(String(raw ?? ''), 10);
+    if (Number.isNaN(parsed)) return fallback;
+    return Math.max(min, Math.min(max, Math.floor(parsed)));
   }
 
   private escapeHtml(str: string): string {
