@@ -21,3 +21,7 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 /docs
+scripts/inspect-*.py
+scripts/sync-*.py
+scripts/verify-*.py
+scripts/start-edge-remote.ps1
