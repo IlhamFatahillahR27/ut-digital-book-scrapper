@@ -66,7 +66,30 @@ async function runBuild() {
     }
   });
 
-  // 3. Copy public assets
+  // 3. Build Offscreen Document Script (IIFE for MV3 Blob URL creation)
+  console.log('[Build] Bundling Offscreen Script (IIFE)...');
+  await build({
+    configFile: false,
+    build: {
+      outDir: distDir,
+      emptyOutDir: false,
+      lib: {
+        entry: path.resolve('src/offscreen/index.ts'),
+        formats: ['iife'],
+        name: 'RbvUtOffscreenScript',
+        fileName: () => 'offscreen.js'
+      },
+      watch: isWatch ? {} : null,
+      rollupOptions: {
+        output: {
+          entryFileNames: 'offscreen.js',
+          extend: true
+        }
+      }
+    }
+  });
+
+  // 4. Copy public assets
   copyPublicAssets();
 
   console.log('✅ [Build] Build completed successfully! Extension is ready in dist/\n');

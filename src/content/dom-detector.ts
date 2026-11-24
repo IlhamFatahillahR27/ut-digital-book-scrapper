@@ -78,6 +78,45 @@ export class DomDetector {
   }
 
   /**
+   * Attempts to detect the book author from Kotobee's left sidebar metadata
+   */
+  static detectBookAuthor(): string | null {
+    const authorCandidates = [
+      document.querySelector('.ion-side-menu.menu-left .book-author')?.textContent,
+      document.querySelector('.ion-side-menu.menu-left .author')?.textContent,
+      document.querySelector('.ion-side-menu.menu-left [class*="author"]')?.textContent,
+      document.querySelector('.book-author')?.textContent,
+      document.querySelector('#bookAuthor')?.textContent
+    ];
+
+    for (const candidate of authorCandidates) {
+      if (candidate && candidate.trim().length > 1) {
+        const cleaned = candidate.trim().replace(/\s+/g, ' ');
+        if (!cleaned.toLowerCase().includes('kotobee')) {
+          return cleaned;
+        }
+      }
+    }
+
+    // Kotobee UT often renders cover thumbnail + title + author in the top header of .menu-left
+    const leftHeader = document.querySelector(
+      '.ion-side-menu.menu-left .book-info, .ion-side-menu.menu-left .bookInfo, .ion-side-menu.menu-left header, .ion-side-menu.menu-left .bar-header'
+    );
+    if (leftHeader) {
+      const bookTitle = this.detectBookTitle().toLowerCase();
+      const lines = (leftHeader.textContent || '')
+        .split('\n')
+        .map((l) => l.trim().replace(/\s+/g, ' '))
+        .filter((l) => l.length > 2 && l.toLowerCase() !== bookTitle && !/table of contents/i.test(l));
+      if (lines.length > 0) {
+        return lines[0];
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Normalizes text for robust chapter title matching:
    * - Converts to lowercase
    * - Normalizes leading zeros (e.g. 'modul 01' -> 'modul 1')

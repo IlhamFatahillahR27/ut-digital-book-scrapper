@@ -27,6 +27,12 @@ export interface OrchestratorCallbacks {
   savePdfFile: (tabId: number, base64: string, filename: string) => Promise<void>;
   /** Pluggable hook for Phase 4 PdfAssembler to collect chapter buffers */
   onChapterCaptured?: ChapterCapturedHook;
+  /**
+   * When true and >= 1 chapter is captured, keeps progress in 'STITCHING' instead of
+   * emitting terminal COMPLETED/STOPPED/ERROR so caller can finish PDF assembly & download
+   * before unlocking the UI.
+   */
+  deferTerminalStatus?: boolean;
 }
 
 export class ExportOrchestrator {
@@ -339,13 +345,22 @@ export class ExportOrchestrator {
         }
 
         const pctAfter = Math.round((seq / totalRequested) * 100);
+        const postPageStatus =
+          seq < totalRequested
+            ? 'WAITING_NEXT'
+            : callbacks.deferTerminalStatus
+              ? 'STITCHING'
+              : 'COMPLETED';
         callbacks.onProgress({
-          status: seq < totalRequested ? 'WAITING_NEXT' : 'COMPLETED',
+          status: postPageStatus,
           currentChapter: seq,
           currentChapterIndex: ch,
           totalChaptersEstimated: totalRequested,
           chapterTitle: resolvedTitle,
-          message: `Halaman ${seq}/${totalRequested} selesai (${(totalBytes / 1024 / 1024).toFixed(2)} MB total)...`,
+          message:
+            seq < totalRequested
+              ? `Halaman ${seq}/${totalRequested} selesai (${(totalBytes / 1024 / 1024).toFixed(2)} MB total)...`
+              : `Halaman ${seq}/${totalRequested} selesai. Menyiapkan penggabungan PDF...`,
           percent: pctAfter,
           capturedCount: capturedChapters.length,
           totalBytes
@@ -385,7 +400,22 @@ export class ExportOrchestrator {
       this.activeTabId = null;
 
       const totalMb = (totalBytes / 1024 / 1024).toFixed(2);
-      if (finalStatus === 'COMPLETED') {
+      if (callbacks.deferTerminalStatus && capturedChapters.length > 0) {
+        const isPartial = finalStatus !== 'COMPLETED';
+        callbacks.onProgress({
+          status: 'STITCHING',
+          currentChapter: capturedChapters.length,
+          currentChapterIndex: lastChapterIndex ?? startChapter,
+          totalChaptersEstimated: totalRequested,
+          chapterTitle: label,
+          message: isPartial
+            ? `Menyimpan parsial: menggabungkan ${capturedChapters.length} halaman & menyusun bookmarks...`
+            : `Menggabungkan ${capturedChapters.length} halaman & menyusun bookmarks PDF...`,
+          percent: isPartial ? Math.round((capturedChapters.length / totalRequested) * 100) : 99,
+          capturedCount: capturedChapters.length,
+          totalBytes
+        });
+      } else if (finalStatus === 'COMPLETED') {
         callbacks.onProgress({
           status: 'COMPLETED',
           currentChapter: capturedChapters.length,
@@ -393,7 +423,7 @@ export class ExportOrchestrator {
           totalChaptersEstimated: totalRequested,
           chapterTitle: label,
           message: `Selesai! ${capturedChapters.length}/${totalRequested} halaman tervalidasi (${totalMb} MB).${
-            range.savePerPageDebug ? ' PDF per halaman telah diunduh.' : ' Siap untuk penggabungan Fase 4.'
+            range.savePerPageDebug ? ' PDF per halaman telah diunduh.' : ''
           }`,
           percent: 100,
           capturedCount: capturedChapters.length,

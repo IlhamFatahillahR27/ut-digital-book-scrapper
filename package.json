@@ -1,6 +1,6 @@
 {
   "name": "rbv-ut-to-pdf-exporter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Microsoft Edge / Chrome Extension to export UT Kotobee digital books into structured PDFs",
   "type": "module",
@@ -14,5 +14,8 @@
     "@types/node": "^22.13.9",
     "typescript": "^5.8.2",
     "vite": "^6.2.0"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
   }
 }

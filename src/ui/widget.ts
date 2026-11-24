@@ -94,9 +94,9 @@ export class FloatingWidget {
               </div>
               <span class="rbv-page-pill" id="rbv-page-count-pill">1 hal</span>
             </div>
-            <label class="rbv-checkbox-row" title="Unduh PDF terpisah untuk setiap halaman (cocok untuk uji rentang kecil 3–5 halaman sebelum penggabungan Fase 4)">
+            <label class="rbv-checkbox-row" title="Selain menghasilkan 1 PDF gabungan ber-bookmark, simpan juga salinan PDF terpisah untuk setiap halaman">
               <input type="checkbox" id="rbv-chk-save-per-page" />
-              <span>Simpan PDF per halaman (Debug)</span>
+              <span>Simpan salinan PDF per halaman (Debug)</span>
             </label>
           </div>
 
@@ -105,11 +105,11 @@ export class FloatingWidget {
             <span id="rbv-status-text">Siap. Pilih modul atau rentang chapter di atas.</span>
           </div>
           <div class="rbv-actions">
-            <button class="rbv-btn rbv-btn-primary" id="rbv-btn-start" title="Mulai navigasi otomatis & cetak rentang halaman terpilih">
-              🚀 Mulai Ekspor Rentang
+            <button class="rbv-btn rbv-btn-primary" id="rbv-btn-start" title="Ekspor rentang terpilih menjadi 1 file PDF utuh dengan Bookmarks/Daftar Isi">
+              🚀 Ekspor ke 1 File PDF
             </button>
             <button class="rbv-btn rbv-btn-danger" id="rbv-btn-stop" style="display: none;">
-              ⏹ Berhenti
+              ⏹ Berhenti &amp; Simpan Parsial
             </button>
             <button class="rbv-btn rbv-btn-secondary" id="rbv-btn-test-print" title="Cetak bab aktif saja untuk menguji format & kelengkapan halaman">
               📄 Uji Cetak 1 Bab (Fase 2)
@@ -120,7 +120,7 @@ export class FloatingWidget {
           </div>
         </div>
         <div class="rbv-footer">
-          Optimized for NotebookLM • v0.2.0 (Fase 3)
+          Optimized for NotebookLM • v0.3.0 (Fase 4)
         </div>
       </div>
     `;
@@ -449,13 +449,17 @@ export class FloatingWidget {
     const selectedModule = structure.modules.find((m) => m.id === selectEl?.value);
     const label = selectedModule ? selectedModule.title : `Rentang Ch ${startChapter}–${endChapter}`;
 
-    // Build chapter title map from TOC for accurate progress messages & filenames
+    // Build chapter title map & filtered hierarchical TOC entries for Phase 4 PDF Bookmarks
     const chapterTitles: Record<number, string> = {};
     for (const item of structure.tocItems) {
       chapterTitles[item.chapterIndex] = item.title;
     }
+    const filteredTocItems = structure.tocItems.filter(
+      (item) => item.chapterIndex >= startChapter && item.chapterIndex <= endChapter
+    );
 
     const bookTitle = DomDetector.detectBookTitle();
+    const bookAuthor = DomDetector.detectBookAuthor();
     this.currentTitle = bookTitle;
 
     this.isExporting = true;
@@ -472,8 +476,10 @@ export class FloatingWidget {
           label,
           bookId: structure.bookId,
           bookTitle,
+          bookAuthor,
           savePerPageDebug: !!savePerPageChk?.checked,
-          chapterTitles
+          chapterTitles,
+          tocItems: filteredTocItems
         }
       }
     };
@@ -527,21 +533,33 @@ export class FloatingWidget {
     this.toggleButtons(false);
 
     const summary: BatchExportSummary | undefined = payload.summary;
+    const filename = summary?.outputFilename || payload.filename;
+    const outputBytes = summary?.outputBytes ?? payload.outputBytes ?? summary?.totalBytes ?? 0;
+    const sizeMb = (outputBytes / 1024 / 1024).toFixed(2);
+    const pdfPages = summary?.totalPdfPages ?? payload.totalPdfPages ?? summary?.capturedCount ?? payload.totalChapters;
+    const bookmarks = summary?.bookmarkCount ?? payload.bookmarkCount ?? 0;
+
     if (summary) {
-      const totalMb = (summary.totalBytes / 1024 / 1024).toFixed(2);
       if (summary.status === 'STOPPED') {
-        this.updateStatus(
-          'idle',
-          `⏹ Dihentikan. ${summary.capturedCount}/${summary.totalRequested} hal selesai (${totalMb} MB).`
-        );
+        if (summary.outputFilename) {
+          this.updateStatus(
+            'idle',
+            `⏹ Dihentikan. PDF parsial diunduh: ${filename} (${pdfPages} hal, ${sizeMb} MB, ${bookmarks} bookmarks).`
+          );
+        } else {
+          this.updateStatus(
+            'idle',
+            `⏹ Dihentikan. ${summary.capturedCount}/${summary.totalRequested} hal selesai.`
+          );
+        }
       } else {
         this.updateStatus(
           'idle',
-          `✅ Selesai! ${summary.capturedCount}/${summary.totalRequested} hal tervalidasi (${totalMb} MB).`
+          `✅ Selesai! ${filename} (${pdfPages} hal, ${sizeMb} MB, ${bookmarks} bookmarks) diunduh.`
         );
       }
     } else {
-      this.updateStatus('idle', `✅ Selesai! ${payload.totalChapters} halaman diproses.`);
+      this.updateStatus('idle', `✅ Selesai! ${filename} (${pdfPages} halaman) diunduh.`);
     }
   }
 

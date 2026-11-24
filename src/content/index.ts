@@ -6,6 +6,18 @@ import { PageNavigator } from './page-navigator';
 import { logger } from '../utils/logger';
 import type { ExtensionMessage } from '../types/messages';
 
+const chunkDownloadJobs = new Map<string, { filename: string; parts: BlobPart[] }>();
+
+function base64ToUint8(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 function setupMessageListeners(): void {
   chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
     switch (message.type) {
@@ -160,6 +172,61 @@ function setupMessageListeners(): void {
           sendResponse({ success: true });
         } catch (err) {
           logger.error('Failed to trigger in-page Blob download:', err);
+          sendResponse({ success: false, error: String(err) });
+        }
+        return false;
+
+      case 'DOWNLOAD_PDF_CHUNK_INIT':
+        try {
+          const { jobId, filename } = message.payload;
+          chunkDownloadJobs.set(jobId, { filename, parts: [] });
+          sendResponse({ success: true });
+        } catch (err) {
+          sendResponse({ success: false, error: String(err) });
+        }
+        return false;
+
+      case 'DOWNLOAD_PDF_CHUNK_APPEND':
+        try {
+          const { jobId, base64Chunk } = message.payload;
+          const job = chunkDownloadJobs.get(jobId);
+          if (!job) {
+            sendResponse({ success: false, error: `Unknown download job: ${jobId}` });
+            return false;
+          }
+          job.parts.push(base64ToUint8(base64Chunk) as unknown as BlobPart);
+          sendResponse({ success: true });
+        } catch (err) {
+          sendResponse({ success: false, error: String(err) });
+        }
+        return false;
+
+      case 'DOWNLOAD_PDF_CHUNK_FINALIZE':
+        try {
+          const { jobId } = message.payload;
+          const job = chunkDownloadJobs.get(jobId);
+          if (!job) {
+            sendResponse({ success: false, error: `Unknown download job: ${jobId}` });
+            return false;
+          }
+          chunkDownloadJobs.delete(jobId);
+          const blob = new Blob(job.parts, { type: 'application/pdf' });
+          const blobUrl = URL.createObjectURL(blob);
+
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = job.filename;
+          document.body.appendChild(a);
+          a.click();
+
+          setTimeout(() => {
+            if (a.parentNode) a.parentNode.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+          }, 15000);
+
+          sendResponse({ success: true });
+        } catch (err) {
+          logger.error('Failed to finalize chunked in-page Blob download:', err);
           sendResponse({ success: false, error: String(err) });
         }
         return false;
