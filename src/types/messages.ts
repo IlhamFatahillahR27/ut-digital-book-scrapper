@@ -24,6 +24,8 @@ export type MessageType =
   | 'RESTORE_PAGE_VIEW_MODE'
   | 'NAVIGATE_TO_CHAPTER'
   | 'ABORT_NAVIGATION'
+  | 'CHECK_PAGE_HEALTH'
+  | 'TOGGLE_WIDGET'
   | 'START_EXPORT'
   | 'START_TEST_PRINT'
   | 'PRINT_ISOLATED_PAGE'
@@ -112,6 +114,21 @@ export interface NavigateToChapterResponse {
 
 export interface AbortNavigationMessage {
   type: 'ABORT_NAVIGATION';
+}
+
+export interface CheckPageHealthMessage {
+  type: 'CHECK_PAGE_HEALTH';
+}
+
+export interface CheckPageHealthResponse {
+  online: boolean;
+  isLoginPage: boolean;
+  isKotobeeReader: boolean;
+  currentHash: string;
+}
+
+export interface ToggleWidgetMessage {
+  type: 'TOGGLE_WIDGET';
 }
 
 export interface StartExportMessage {
@@ -280,6 +297,8 @@ export type ExtensionMessage =
   | RestorePageViewModeMessage
   | NavigateToChapterMessage
   | AbortNavigationMessage
+  | CheckPageHealthMessage
+  | ToggleWidgetMessage
   | StartExportMessage
   | StartTestPrintMessage
   | PrintIsolatedPageMessage

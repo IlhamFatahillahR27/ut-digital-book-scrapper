@@ -6,6 +6,17 @@ import {
   type PrintToPdfResponse
 } from '../types/cdp';
 
+export class CdpPrintTimeoutError extends Error {
+  readonly timeoutMs: number;
+  constructor(timeoutMs: number) {
+    super(
+      `Timeout (${Math.round(timeoutMs / 1000)} dtk) saat merender PDF melalui browser. Halaman terlalu berat atau frame tidak merespons.`
+    );
+    this.name = 'CdpPrintTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export class CdpPrinter {
   private debuggerManager: DebuggerManager;
 
@@ -26,9 +37,13 @@ export class CdpPrinter {
   }
 
   /**
-   * Executes Page.printToPDF via CDP and returns both base64 string and Uint8Array buffer
+   * Executes Page.printToPDF via CDP with a bounded timeout and PDF header validation,
+   * returning both base64 string and Uint8Array buffer.
    */
-  async printCurrentPage(customOptions?: Partial<PrintToPdfOptions>): Promise<{
+  async printCurrentPage(
+    customOptions?: Partial<PrintToPdfOptions>,
+    timeoutMs = 35000
+  ): Promise<{
     base64: string;
     buffer: Uint8Array;
   }> {
@@ -53,22 +68,46 @@ export class CdpPrinter {
 
     const finalOptions = { ...defaultOptions, ...customOptions };
 
-    logger.info(`Executing CDP Page.printToPDF with options (pageRanges: ${finalOptions.pageRanges || 'all'})...`);
+    logger.info(
+      `Executing CDP Page.printToPDF (pageRanges: ${finalOptions.pageRanges || 'all'}, timeout: ${timeoutMs}ms)...`
+    );
     const startTime = Date.now();
 
-    const response = await this.debuggerManager.sendCommand<PrintToPdfResponse>(
-      'Page.printToPDF',
-      finalOptions
-    );
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+    const response = await Promise.race([
+      this.debuggerManager.sendCommand<PrintToPdfResponse>('Page.printToPDF', finalOptions),
+      new Promise<never>((_, reject) => {
+        timeoutTimer = setTimeout(() => {
+          reject(new CdpPrintTimeoutError(timeoutMs));
+        }, Math.max(1000, timeoutMs));
+      })
+    ]).finally(() => {
+      if (timeoutTimer !== null) {
+        clearTimeout(timeoutTimer);
+      }
+    });
 
     if (!response || !response.data) {
-      throw new Error('CDP Page.printToPDF returned an empty or invalid response.');
+      throw new Error('CDP Page.printToPDF mengembalikan respons kosong atau tidak valid.');
     }
 
     const elapsed = Date.now() - startTime;
     logger.info(`Page.printToPDF completed in ${elapsed}ms. Base64 length: ${response.data.length}`);
 
     const buffer = this.base64ToUint8Array(response.data);
+    if (
+      buffer.byteLength <= 100 ||
+      buffer[0] !== 0x25 ||
+      buffer[1] !== 0x50 ||
+      buffer[2] !== 0x44 ||
+      buffer[3] !== 0x46 ||
+      buffer[4] !== 0x2d
+    ) {
+      throw new Error(
+        `Output PDF dari browser tidak valid (${buffer.byteLength} bytes, header %PDF- tidak ditemukan).`
+      );
+    }
+
     logger.info(`Converted PDF to binary buffer: ${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
 
     return {

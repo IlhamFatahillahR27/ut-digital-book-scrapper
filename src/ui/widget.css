@@ -10,17 +10,17 @@
 }
 
 .rbv-card {
-  width: 320px;
+  width: 332px;
   background: #ffffff;
   border-radius: 12px;
-  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.2), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+  box-shadow: 0 12px 28px -6px rgba(15, 23, 42, 0.22), 0 6px 12px -6px rgba(15, 23, 42, 0.12);
   border: 1px solid #e2e8f0;
   overflow: hidden;
   transition: width 0.2s ease, box-shadow 0.2s ease;
 }
 
 .rbv-card.minimized {
-  width: 220px;
+  width: 236px;
 }
 
 .rbv-card.minimized .rbv-body,
@@ -37,6 +37,7 @@
   justify-content: space-between;
   cursor: grab;
   user-select: none;
+  position: relative;
 }
 
 .rbv-header:active {
@@ -57,8 +58,46 @@
   gap: 6px;
 }
 
+.rbv-header-pct {
+  display: none;
+  background: rgba(255, 255, 255, 0.24);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rbv-card.minimized.is-exporting .rbv-header-pct {
+  display: inline-flex;
+  align-items: center;
+}
+
+.rbv-mini-progress {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.22);
+  overflow: hidden;
+}
+
+.rbv-card.minimized.is-exporting .rbv-mini-progress {
+  display: block;
+}
+
+.rbv-mini-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: #fde047;
+  transition: width 0.25s ease;
+}
+
 .rbv-icon-btn {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.16);
   border: none;
   color: #ffffff;
   width: 24px;
@@ -88,7 +127,7 @@
 }
 
 .rbv-body {
-  padding: 14px 16px;
+  padding: 13px 15px;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -97,7 +136,7 @@
 .rbv-book-info {
   background: #f8fafc;
   border-radius: 8px;
-  padding: 10px;
+  padding: 9px 10px;
   border: 1px solid #f1f5f9;
 }
 
@@ -235,19 +274,229 @@
   white-space: nowrap;
 }
 
-.rbv-checkbox-row {
+.rbv-advisory-tip {
+  display: none;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  color: #92400e;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.rbv-advisory-tip.visible {
+  display: block;
+}
+
+/* Interactive Progress Card (Phase 5) */
+.rbv-progress-card {
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.rbv-progress-card.visible {
+  display: flex;
+}
+
+.rbv-progress-top {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.rbv-phase-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.rbv-phase-badge.retrying {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.rbv-phase-badge.stitching {
+  background: #ede9fe;
+  color: #6d28d9;
+}
+
+.rbv-phase-badge.success {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.rbv-phase-badge.error {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.rbv-phase-badge.partial {
+  background: #ffedd5;
+  color: #c2410c;
+}
+
+.rbv-progress-pct {
+  font-size: 12px;
+  font-weight: 700;
+  color: #0f172a;
+  font-variant-numeric: tabular-nums;
+}
+
+.rbv-progress-track {
+  width: 100%;
+  height: 8px;
+  background: #e2e8f0;
+  border-radius: 999px;
+  overflow: hidden;
+  position: relative;
+}
+
+.rbv-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #0284c7, #38bdf8);
+  transition: width 0.25s ease, background-color 0.2s ease;
+}
+
+.rbv-progress-fill.animated {
+  background-size: 24px 24px;
+  background-image: linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.22) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.22) 50%,
+    rgba(255, 255, 255, 0.22) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-color: #0284c7;
+  animation: rbv-stripe 0.8s linear infinite;
+}
+
+.rbv-progress-fill.retrying {
+  background-color: #d97706;
+}
+
+.rbv-progress-fill.stitching {
+  background-color: #7c3aed;
+}
+
+.rbv-progress-fill.success {
+  background: #10b981;
+  animation: none;
+}
+
+.rbv-progress-fill.error {
+  background: #ef4444;
+  animation: none;
+}
+
+.rbv-progress-fill.partial {
+  background: #f97316;
+  animation: none;
+}
+
+@keyframes rbv-stripe {
+  0% { background-position: 0 0; }
+  100% { background-position: 24px 0; }
+}
+
+.rbv-progress-headline {
+  font-size: 12px;
+  font-weight: 600;
+  color: #0f172a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rbv-progress-sub {
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rbv-telemetry-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 6px;
   font-size: 11px;
   color: #475569;
-  cursor: pointer;
-  user-select: none;
+  font-variant-numeric: tabular-nums;
 }
 
-.rbv-checkbox-row input[type="checkbox"] {
-  margin: 0;
+.rbv-skip-pill {
+  display: none;
+  background: #fef3c7;
+  color: #b45309;
+  border: 1px solid #fde68a;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.rbv-skip-pill.visible {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+/* Resume / Partial Action Banner */
+.rbv-resume-banner {
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: #9a3412;
+}
+
+.rbv-resume-banner.visible {
+  display: flex;
+}
+
+.rbv-btn-resume {
+  background: #ea580c;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  transition: background-color 0.15s ease;
+}
+
+.rbv-btn-resume:hover {
+  background: #c2410c;
 }
 
 .rbv-status-row {
@@ -256,7 +505,7 @@
   gap: 8px;
   font-size: 12px;
   color: #475569;
-  min-height: 32px;
+  min-height: 24px;
   line-height: 1.4;
 }
 
@@ -287,8 +536,8 @@
 .rbv-actions {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-top: 4px;
+  gap: 7px;
+  margin-top: 2px;
 }
 
 .rbv-btn {
@@ -305,6 +554,7 @@
   gap: 6px;
   transition: all 0.15s ease;
   box-sizing: border-box;
+  font-family: inherit;
 }
 
 .rbv-btn-secondary {
@@ -356,11 +606,79 @@
   cursor: not-allowed;
 }
 
+/* Collapsible Advanced / Diagnostics Drawer */
+.rbv-advanced {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  overflow: hidden;
+}
+
+.rbv-advanced-summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 7px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  user-select: none;
+}
+
+.rbv-advanced-summary::-webkit-details-marker {
+  display: none;
+}
+
+.rbv-advanced-summary:hover {
+  color: #0f172a;
+  background: #f1f5f9;
+}
+
+.rbv-advanced[open] .rbv-advanced-caret {
+  transform: rotate(180deg);
+}
+
+.rbv-advanced-caret {
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+
+.rbv-advanced-body {
+  padding: 8px 10px 10px;
+  border-top: 1px solid #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #ffffff;
+}
+
+.rbv-adv-grid {
+  display: flex;
+  gap: 8px;
+}
+
+.rbv-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #475569;
+  cursor: pointer;
+  user-select: none;
+}
+
+.rbv-checkbox-row input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
 .rbv-footer {
   font-size: 11px;
   color: #94a3b8;
   text-align: center;
   border-top: 1px solid #f1f5f9;
-  padding: 8px;
+  padding: 7px 8px;
   background: #fcfcfc;
 }

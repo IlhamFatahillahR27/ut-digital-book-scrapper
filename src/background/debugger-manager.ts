@@ -10,6 +10,45 @@ export class DebuggerManager {
     this.setupListeners();
   }
 
+  /**
+   * Maps low-level Chromium / CDP debugger errors and detach reasons into
+   * clear, actionable Indonesian messages for students.
+   */
+  static formatFriendlyError(errOrReason: unknown): string {
+    const raw = errOrReason instanceof Error ? errOrReason.message : String(errOrReason ?? '');
+    const lower = raw.toLowerCase();
+
+    if (lower.includes('another debugger is already attached')) {
+      return 'DevTools (F12 / Inspect) sedang terbuka pada tab ini. Tutup jendela DevTools terlebih dahulu lalu coba lagi.';
+    }
+    if (lower.includes('canceled_by_user') || lower.includes('cancelled_by_user')) {
+      return 'Sesi cetak dibatalkan karena tombol "Cancel" pada banner debugging browser diklik.';
+    }
+    if (lower.includes('tab_closed') || lower.includes('target closed') || lower.includes('no tab with id')) {
+      return 'Tab Kotobee ditutup saat proses ekspor berlangsung.';
+    }
+    if (lower.includes('navigated_away')) {
+      return 'Tab berpindah ke halaman/situs lain saat proses ekspor berlangsung.';
+    }
+    if (lower.includes('tab_reloaded')) {
+      return 'Halaman Kotobee dimuat ulang (refresh) saat proses ekspor berlangsung.';
+    }
+    if (lower.includes('frame was detached') || lower.includes('execution context was destroyed')) {
+      return 'Frame pembaca Kotobee sempat terputus atau dimuat ulang oleh browser.';
+    }
+    if (lower.includes('detached while handling command') || lower.includes('debugger is not attached')) {
+      return 'Koneksi Chrome DevTools Protocol terputus di tengah proses cetak.';
+    }
+    if (lower.includes('cannot access a chrome://') || lower.includes('cannot attach to this target')) {
+      return 'Halaman ini tidak dapat diakses oleh ekstensi. Pastikan Anda berada di halaman pembaca Kotobee UT.';
+    }
+    if (lower.includes('receiving end does not exist') || lower.includes('could not establish connection')) {
+      return 'Koneksi ke halaman Kotobee terputus. Coba muat ulang halaman lalu lanjutkan ekspor.';
+    }
+
+    return raw || 'Terjadi kesalahan tidak terduga pada sesi browser.';
+  }
+
   onUnexpectedDetach(listener: (tabId: number, reason: string) => void): () => void {
     this.unexpectedDetachListeners.add(listener);
     return () => {
@@ -102,16 +141,9 @@ export class DebuggerManager {
       this.attachedBaseUrl = this.stripHash(tab?.url);
       logger.info(`Debugger successfully attached to tab ${tabId} (base: ${this.attachedBaseUrl ?? 'unknown'})`);
     } catch (err) {
-      const errorStr = String(err);
-      if (errorStr.includes('Another debugger is already attached')) {
-        const customErr = new Error(
-          'DevTools (F12) terdeteksi aktif pada tab Kotobee ini. Silakan tutup jendela DevTools (Inspect) terlebih dahulu lalu coba lagi.'
-        );
-        logger.error('Failed to attach debugger:', customErr.message);
-        throw customErr;
-      }
+      const friendly = DebuggerManager.formatFriendlyError(err);
       logger.error(`Failed to attach debugger to tab ${tabId}:`, err);
-      throw err;
+      throw new Error(friendly);
     }
   }
 

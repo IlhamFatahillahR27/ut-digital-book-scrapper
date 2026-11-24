@@ -18,6 +18,7 @@ export class MessageRouter {
   private orchestrator: ExportOrchestrator;
   private pdfDownloader: PdfDownloader;
   private isFinalizing = false;
+  private activeTabId: number | null = null;
   private currentProgress: ExportProgress = {
     status: 'IDLE',
     currentChapter: 0,
@@ -88,24 +89,33 @@ export class MessageRouter {
     }
 
     try {
+      this.activeTabId = tabId;
       this.updateProgress({
         status: 'INITIALIZING',
         currentChapter: 1,
-        chapterTitle: message.payload?.chapterTitle || 'Bab Aktif',
-        message: 'Menghubungkan debugger ke tab Kotobee...'
-      });
+        totalChaptersEstimated: 1,
+        chapterTitle: message.payload?.chapterTitle || 'Halaman Aktif',
+        moduleLabel: 'Halaman Aktif',
+        phaseLabel: 'Inisialisasi',
+        percent: 10,
+        message: 'Menghubungkan browser ke tab Kotobee...'
+      }, tabId);
 
       // 1. Attach debugger
       await this.debuggerManager.attach(tabId);
       await this.cdpPrinter.prepare();
 
-      // 2. Prepare page (auto-scroll & style overrides)
+      // 2. Prepare page (isolated print stage)
       this.updateProgress({
         status: 'CAPTURING_PAGE',
         currentChapter: 1,
-        chapterTitle: message.payload?.chapterTitle || 'Bab Aktif',
-        message: 'Auto-scroll & memuat gambar blob / rumus...'
-      });
+        totalChaptersEstimated: 1,
+        chapterTitle: message.payload?.chapterTitle || 'Halaman Aktif',
+        moduleLabel: 'Halaman Aktif',
+        phaseLabel: 'Menyiapkan',
+        percent: 45,
+        message: 'Menyiapkan halaman bersih & memproses gambar...'
+      }, tabId);
 
       let prepResult: PrepareForPrintResponse = { success: false, chapterTitle: 'Bab_Aktif' };
       try {
@@ -127,9 +137,13 @@ export class MessageRouter {
       this.updateProgress({
         status: 'CAPTURING_PAGE',
         currentChapter: 1,
+        totalChaptersEstimated: 1,
         chapterTitle,
-        message: 'Mengeksekusi CDP Page.printToPDF (A4)...'
-      });
+        moduleLabel: 'Halaman Aktif',
+        phaseLabel: 'Cetak PDF',
+        percent: 75,
+        message: 'Mencetak halaman aktif ke PDF...'
+      }, tabId);
 
       const { base64, buffer } = await this.cdpPrinter.printCurrentPage({
         printBackground: true,
@@ -147,23 +161,33 @@ export class MessageRouter {
       // 5. Detach debugger immediately
       await this.debuggerManager.detach();
 
-      // 6. Download test PDF file
+      // 6. Download single page PDF file
       this.updateProgress({
-        status: 'COMPLETED',
+        status: 'STITCHING',
         currentChapter: 1,
+        totalChaptersEstimated: 1,
         chapterTitle,
-        message: 'Menyimpan file PDF hasil uji coba...'
-      });
+        moduleLabel: 'Halaman Aktif',
+        phaseLabel: 'Mengunduh',
+        percent: 95,
+        message: 'Menyimpan file PDF halaman aktif...'
+      }, tabId);
 
-      const filename = sanitizeFilename(`[Uji_Fase2]_${bookTitle}_${chapterTitle}`);
+      const filename = sanitizeFilename(`${bookTitle}_${chapterTitle}`);
       await this.savePdfFile(tabId, base64, filename);
 
       this.updateProgress({
         status: 'COMPLETED',
         currentChapter: 1,
+        totalChaptersEstimated: 1,
         chapterTitle,
-        message: `Berhasil! File ${filename} telah diunduh. Silakan buka & periksa.`
-      });
+        moduleLabel: 'Halaman Aktif',
+        phaseLabel: 'Selesai',
+        percent: 100,
+        capturedCount: 1,
+        totalBytes: buffer.byteLength,
+        message: `Berhasil! ${filename} telah diunduh.`
+      }, tabId);
 
       sendResponse({
         success: true,
@@ -172,7 +196,7 @@ export class MessageRouter {
         fileSizeMb: (buffer.byteLength / 1024 / 1024).toFixed(2)
       });
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = DebuggerManager.formatFriendlyError(err);
       logger.error('Error during handleStartTestPrint:', err);
 
       // Guarantee cleanup
@@ -189,10 +213,13 @@ export class MessageRouter {
         status: 'ERROR',
         currentChapter: 0,
         chapterTitle: 'Error',
-        message: `Gagal uji cetak: ${errorMsg}`
-      });
+        phaseLabel: 'Error',
+        message: `Gagal cetak halaman aktif: ${errorMsg}`
+      }, tabId);
 
       sendResponse({ success: false, error: errorMsg });
+    } finally {
+      this.activeTabId = null;
     }
   }
 
@@ -252,20 +279,28 @@ export class MessageRouter {
 
     // Reset progress to INITIALIZING synchronously before acknowledging start
     // so widget polling never reads stale COMPLETED/STOPPED/ERROR from a previous session.
+    this.activeTabId = tabId;
     this.updateProgress({
       status: 'INITIALIZING',
       currentChapter: 0,
       currentChapterIndex: range.startChapter,
       totalChaptersEstimated: range.endChapter - range.startChapter + 1,
       chapterTitle: range.label,
+      moduleLabel: range.label,
+      startChapter: range.startChapter,
+      endChapter: range.endChapter,
+      phaseLabel: 'Inisialisasi',
       message: `Memulai ekspor untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`,
       percent: 0,
       capturedCount: 0,
-      totalBytes: 0
-    });
+      failedCount: 0,
+      totalBytes: 0,
+      startedAt: Date.now(),
+      etaSeconds: null
+    }, tabId);
 
     // Acknowledge start immediately so long-running batches never hit sendMessage IPC timeouts;
-    // live updates are delivered via GET_STATUS polling + EXPORT_COMPLETE/EXPORT_ERROR push notifications.
+    // live updates are delivered via real-time EXPORT_PROGRESS push + GET_STATUS fallback polling.
     sendResponse({
       success: true,
       message: `Memulai ekspor untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`
@@ -274,7 +309,7 @@ export class MessageRouter {
     // Launch batch export + incremental stitching asynchronously
     this.orchestrator
       .runBatchExport(tabId, range, message.payload?.config, {
-        onProgress: (progress) => this.updateProgress(progress),
+        onProgress: (progress) => this.updateProgress(progress, tabId),
         savePdfFile: (tId, base64, filename) => this.savePdfFile(tId, base64, filename),
         deferTerminalStatus: true,
         onChapterCaptured: async (buffer, meta) => {
@@ -304,15 +339,19 @@ export class MessageRouter {
               currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
               totalChaptersEstimated: summary.totalRequested,
               chapterTitle: range.label,
+              moduleLabel: range.label,
+              phaseLabel: 'Menggabungkan',
               message: isPartial
-                ? `Menyimpan PDF parsial (${summary.capturedCount} hal) & menyusun bookmarks...`
+                ? `Menyelamatkan PDF parsial (${summary.capturedCount} hal) & menyusun bookmarks...`
                 : `Menggabungkan ${summary.capturedCount} hal & menyusun bookmarks PDF...`,
               percent: isPartial
                 ? Math.round((summary.capturedCount / summary.totalRequested) * 100)
                 : 99,
               capturedCount: summary.capturedCount,
-              totalBytes: summary.totalBytes
-            });
+              failedCount: summary.failedCount,
+              totalBytes: summary.totalBytes,
+              etaSeconds: 0
+            }, tabId);
 
             const assembled = await assembler.finalize(range.tocItems, { isPartial });
 
@@ -328,11 +367,15 @@ export class MessageRouter {
               currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
               totalChaptersEstimated: summary.totalRequested,
               chapterTitle: range.label,
+              moduleLabel: range.label,
+              phaseLabel: 'Mengunduh',
               message: `Mengunduh ${outputFilename} (${sizeMb} MB, ${assembled.bookmarkCount} bookmarks)...`,
               percent: 99,
               capturedCount: summary.capturedCount,
-              totalBytes: assembled.bytes.byteLength
-            });
+              failedCount: summary.failedCount,
+              totalBytes: assembled.bytes.byteLength,
+              etaSeconds: 0
+            }, tabId);
 
             const dlResult = await this.pdfDownloader.downloadBytes(
               tabId,
@@ -347,17 +390,23 @@ export class MessageRouter {
             summary.downloadId = dlResult.downloadId;
 
             if (summary.status === 'COMPLETED') {
+              const skippedSuffix =
+                summary.failedCount > 0 ? ` (${summary.failedCount} hal dilewati)` : '';
               this.updateProgress({
                 status: 'COMPLETED',
                 currentChapter: summary.capturedCount,
                 currentChapterIndex: summary.lastChapterIndex ?? summary.endChapter,
                 totalChaptersEstimated: summary.totalRequested,
                 chapterTitle: range.label,
-                message: `Selesai! ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB, ${assembled.bookmarkCount} bookmarks) diunduh.`,
+                moduleLabel: range.label,
+                phaseLabel: 'Selesai',
+                message: `Selesai! ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB, ${assembled.bookmarkCount} bookmarks)${skippedSuffix}.`,
                 percent: 100,
                 capturedCount: summary.capturedCount,
-                totalBytes: assembled.bytes.byteLength
-              });
+                failedCount: summary.failedCount,
+                totalBytes: assembled.bytes.byteLength,
+                etaSeconds: 0
+              }, tabId);
 
               await chrome.tabs
                 .sendMessage(tabId, {
@@ -368,7 +417,7 @@ export class MessageRouter {
                     totalPdfPages: assembled.totalPages,
                     bookmarkCount: assembled.bookmarkCount,
                     outputBytes: assembled.bytes.byteLength,
-                    isPartial: false,
+                    isPartial: summary.failedCount > 0,
                     downloadId: dlResult.downloadId,
                     summary
                   }
@@ -381,11 +430,15 @@ export class MessageRouter {
                 currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
                 totalChaptersEstimated: summary.totalRequested,
                 chapterTitle: 'Dihentikan (Parsial Tersimpan)',
+                moduleLabel: range.label,
+                phaseLabel: 'Parsial',
                 message: `Dihentikan. PDF parsial disimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB, ${assembled.bookmarkCount} bookmarks).`,
                 percent: Math.round((summary.capturedCount / summary.totalRequested) * 100),
                 capturedCount: summary.capturedCount,
-                totalBytes: assembled.bytes.byteLength
-              });
+                failedCount: summary.failedCount,
+                totalBytes: assembled.bytes.byteLength,
+                etaSeconds: null
+              }, tabId);
 
               await chrome.tabs
                 .sendMessage(tabId, {
@@ -410,11 +463,15 @@ export class MessageRouter {
                 currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
                 totalChaptersEstimated: summary.totalRequested,
                 chapterTitle: 'Error (Parsial Tersimpan)',
+                moduleLabel: range.label,
+                phaseLabel: 'Error (Parsial)',
                 message: `Terhenti karena error, namun PDF parsial tersimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB).`,
                 percent: Math.round((summary.capturedCount / summary.totalRequested) * 100),
                 capturedCount: summary.capturedCount,
-                totalBytes: assembled.bytes.byteLength
-              });
+                failedCount: summary.failedCount,
+                totalBytes: assembled.bytes.byteLength,
+                etaSeconds: null
+              }, tabId);
 
               await chrome.tabs
                 .sendMessage(tabId, {
@@ -422,6 +479,7 @@ export class MessageRouter {
                   payload: {
                     message: summary.errorMessage || 'Ekspor terhenti di tengah proses.',
                     details: `PDF parsial tersimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB).`,
+                    recoverable: summary.resumeFromChapter !== null && summary.resumeFromChapter !== undefined,
                     partialFilename: outputFilename,
                     summary
                   }
@@ -479,11 +537,13 @@ export class MessageRouter {
         } finally {
           assembler.dispose();
           this.isFinalizing = false;
+          this.activeTabId = null;
         }
       })
       .catch((err) => {
         assembler.dispose();
         this.isFinalizing = false;
+        this.activeTabId = null;
         logger.error('Unhandled error in orchestrator.runBatchExport:', err);
       });
   }
@@ -495,7 +555,7 @@ export class MessageRouter {
   ): Promise<void> {
     logger.info('Stopping export session by user request.');
     await this.orchestrator.stop(message.reason || 'User manual stop', (progress) =>
-      this.updateProgress(progress)
+      this.updateProgress(progress, this.activeTabId ?? undefined)
     );
     if (!this.orchestrator.isRunning() && !this.isFinalizing) {
       await this.debuggerManager.detach().catch(() => {});
@@ -503,8 +563,9 @@ export class MessageRouter {
         status: 'STOPPED',
         currentChapter: 0,
         chapterTitle: 'Dihentikan',
+        phaseLabel: 'Dihentikan',
         message: 'Proses ekspor dihentikan oleh pengguna.'
-      });
+      }, this.activeTabId ?? undefined);
     }
     sendResponse({ success: true, message: 'Permintaan berhenti diterima.' });
   }
@@ -534,7 +595,18 @@ export class MessageRouter {
     }
   }
 
-  private updateProgress(progress: ExportProgress): void {
+  private updateProgress(progress: ExportProgress, tabId?: number): void {
     this.currentProgress = progress;
+    const targetTabId = tabId ?? this.activeTabId;
+    if (targetTabId !== null && typeof chrome !== 'undefined' && chrome.tabs?.sendMessage) {
+      chrome.tabs
+        .sendMessage(targetTabId, {
+          type: 'EXPORT_PROGRESS',
+          payload: progress
+        })
+        .catch(() => {
+          // Tab may be busy or closed; widget also reconciles via GET_STATUS fallback
+        });
+    }
   }
 }

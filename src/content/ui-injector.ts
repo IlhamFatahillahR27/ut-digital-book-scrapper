@@ -62,4 +62,23 @@ export class UiInjector {
   getWidget(): FloatingWidget | null {
     return this.widget;
   }
+
+  /**
+   * Ensures the floating host element stays clamped within current viewport bounds
+   */
+  ensureVisibleInViewport(): void {
+    if (!this.rootElement) return;
+    const rect = this.rootElement.getBoundingClientRect();
+    if (
+      rect.right < 40 ||
+      rect.left > window.innerWidth - 40 ||
+      rect.bottom < 40 ||
+      rect.top > window.innerHeight - 40
+    ) {
+      this.rootElement.style.setProperty('left', 'auto', 'important');
+      this.rootElement.style.setProperty('bottom', 'auto', 'important');
+      this.rootElement.style.setProperty('top', '80px', 'important');
+      this.rootElement.style.setProperty('right', '24px', 'important');
+    }
+  }
 }

@@ -6,10 +6,18 @@ const isWatch = process.argv.includes('--watch');
 const distDir = path.resolve('dist');
 const publicDir = path.resolve('public');
 
+const EXCLUDED_PUBLIC_FILES = new Set(['icon_ut.png', '.DS_Store', 'Thumbs.db']);
+
 function copyPublicAssets() {
   if (fs.existsSync(publicDir)) {
-    fs.cpSync(publicDir, distDir, { recursive: true });
-    console.log('[Build] Copied public assets (manifest.json, icons) to dist/');
+    fs.cpSync(publicDir, distDir, {
+      recursive: true,
+      filter: (src) => {
+        const base = path.basename(src);
+        return !EXCLUDED_PUBLIC_FILES.has(base);
+      }
+    });
+    console.log('[Build] Copied clean public assets (manifest.json, offscreen.html, icons/) to dist/');
   }
 }
 
@@ -25,9 +33,11 @@ async function runBuild() {
   console.log('[Build] Bundling Background Service Worker (ESM)...');
   await build({
     configFile: false,
+    publicDir: false,
     build: {
       outDir: distDir,
       emptyOutDir: false,
+      sourcemap: isWatch,
       lib: {
         entry: path.resolve('src/background/index.ts'),
         formats: ['es'],
@@ -47,9 +57,11 @@ async function runBuild() {
   console.log('[Build] Bundling Content Script (IIFE)...');
   await build({
     configFile: false,
+    publicDir: false,
     build: {
       outDir: distDir,
       emptyOutDir: false,
+      sourcemap: isWatch,
       lib: {
         entry: path.resolve('src/content/index.ts'),
         formats: ['iife'],
@@ -70,9 +82,11 @@ async function runBuild() {
   console.log('[Build] Bundling Offscreen Script (IIFE)...');
   await build({
     configFile: false,
+    publicDir: false,
     build: {
       outDir: distDir,
       emptyOutDir: false,
+      sourcemap: isWatch,
       lib: {
         entry: path.resolve('src/offscreen/index.ts'),
         formats: ['iife'],
