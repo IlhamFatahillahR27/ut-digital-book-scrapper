@@ -3,7 +3,7 @@
 **Effective Date:** November 25, 2026  
 **Extension Name:** RBV-UT to PDF Exporter  
 **Gecko Add-on ID:** `rbv-ut-pdf-exporter@ut-helper.mozilla`  
-**Version:** 1.0.0  
+**Version:** 1.1.0  
 
 ---
 

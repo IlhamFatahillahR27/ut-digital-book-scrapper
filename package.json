@@ -1,6 +1,6 @@
 {
   "name": "rbv-ut-to-pdf-exporter",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Mozilla Firefox Add-on (Manifest V3) to export UT Kotobee digital books into structured searchable PDFs",
   "type": "module",
@@ -9,6 +9,7 @@
     "build": "tsc --noEmit && node scripts/build.js",
     "type-check": "tsc --noEmit",
     "lint:amo": "addons-linter dist",
+    "test:toc": "node scripts/run-ts-test.js scripts/test-toc-selection.ts",
     "test:assembler": "node scripts/run-ts-test.js scripts/test-pdf-assembler.ts",
     "test:resilience": "node scripts/run-ts-test.js scripts/test-fase5-resilience.ts",
     "package": "npm run build && npm run lint:amo && node scripts/package.js",
