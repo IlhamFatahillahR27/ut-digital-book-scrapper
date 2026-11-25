@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "RBV-UT to PDF Exporter",
   "short_name": "RBV-UT PDF",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Ekspor Buku Materi Pokok (BMP) digital Kotobee Universitas Terbuka menjadi satu file PDF vektor utuh yang bersih dan searchable.",
   "browser_specific_settings": {
     "gecko": {
