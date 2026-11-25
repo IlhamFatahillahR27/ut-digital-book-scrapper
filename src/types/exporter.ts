@@ -33,6 +33,8 @@ export interface ModuleRange {
   endChapter: number;
   pageCount: number;
   isFullBook?: boolean;
+  /** Relative nesting depth (0 = top-level section, 1+ = sub-section such as KB 1) */
+  level?: number;
 }
 
 export interface BookStructureInfo {

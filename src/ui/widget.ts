@@ -4,6 +4,16 @@ import { TocParser } from '../content/toc-parser';
 import { logger } from '../utils/logger';
 import { loadWidgetPreferences, saveWidgetPreferences } from '../utils/storage';
 import {
+  computeSelectedChapterRange,
+  findDefaultTocIndex,
+  getSelectableTocModules,
+  getTocItemState,
+  matchSelectionFromChapterRange,
+  selectAllTocItems,
+  toggleTocItemSelection,
+  type ContiguousTocSelection
+} from './toc-selection';
+import {
   DEFAULT_EXPORTER_CONFIG,
   type BookStructureInfo,
   type BatchExportSummary,
@@ -29,15 +39,17 @@ export class FloatingWidget {
   private pollIntervalId: number | null = null;
   private keepAlivePort: chrome.runtime.Port | null = null;
   private bookStructure: BookStructureInfo | null = null;
+  private selectableModules: ModuleRange[] = [];
+  private tocSelection: ContiguousTocSelection | null = null;
   private pendingResumeChapter: number | null = null;
-  private appVersion = '1.0.0';
+  private appVersion = '1.1.0';
 
   constructor(shadowRoot: ShadowRoot) {
     this.shadowRoot = shadowRoot;
     try {
-      this.appVersion = chrome.runtime.getManifest?.().version || '1.0.0';
+      this.appVersion = chrome.runtime.getManifest?.().version || '1.1.0';
     } catch {
-      this.appVersion = '1.0.0';
+      this.appVersion = '1.1.0';
     }
     this.init();
   }
@@ -96,11 +108,21 @@ export class FloatingWidget {
           <div class="rbv-range-panel">
             <div class="rbv-range-header">
               <span class="rbv-book-label">Modul / Rentang Halaman</span>
-              <button class="rbv-refresh-btn" id="rbv-btn-refresh-toc" title="Pindai ulang Daftar Isi (TOC) Kotobee">↻ Pindai TOC</button>
+              <button class="rbv-refresh-btn" id="rbv-btn-refresh-toc" type="button" title="Pindai ulang Daftar Isi (TOC) Kotobee">↻ Pindai TOC</button>
             </div>
-            <select class="rbv-select" id="rbv-module-select">
-              <option value="custom">Memindai Daftar Isi Kotobee...</option>
-            </select>
+            <div class="rbv-toc-toolbar" id="rbv-toc-toolbar">
+              <span class="rbv-toc-summary is-manual" id="rbv-toc-summary">Memindai TOC...</span>
+              <div class="rbv-toc-actions">
+                <button class="rbv-toc-mini-btn" id="rbv-btn-toc-all" type="button" title="Pilih seluruh TOC dari awal hingga akhir buku" disabled>Semua</button>
+                <button class="rbv-toc-mini-btn" id="rbv-btn-toc-reset" type="button" title="Kosongkan pilihan TOC agar bisa memilih mulai dari bagian mana pun" disabled>Reset</button>
+              </div>
+            </div>
+            <div class="rbv-toc-list" id="rbv-toc-list" role="group" aria-label="Daftar Isi (TOC) Berurutan">
+              <div class="rbv-toc-empty">Memindai Daftar Isi Kotobee...</div>
+            </div>
+            <div class="rbv-toc-rule-hint" id="rbv-toc-rule-hint">
+              Pilih 1 atau beberapa TOC berurutan (atas/bawah) agar halaman tidak lompat.
+            </div>
             <div class="rbv-range-inputs">
               <div class="rbv-input-group">
                 <span class="rbv-input-label">Dari Ch</span>
@@ -198,7 +220,8 @@ export class FloatingWidget {
     const diagBtn = this.shadowRoot.querySelector('#rbv-btn-diag') as HTMLButtonElement | null;
     const refreshTocBtn = this.shadowRoot.querySelector('#rbv-btn-refresh-toc') as HTMLButtonElement | null;
     const resumeBtn = this.shadowRoot.querySelector('#rbv-btn-resume') as HTMLButtonElement | null;
-    const moduleSelect = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
+    const selectAllTocBtn = this.shadowRoot.querySelector('#rbv-btn-toc-all') as HTMLButtonElement | null;
+    const resetTocBtn = this.shadowRoot.querySelector('#rbv-btn-toc-reset') as HTMLButtonElement | null;
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
     const saveChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
@@ -211,8 +234,9 @@ export class FloatingWidget {
     diagBtn?.addEventListener('click', () => this.handleCopyDiagnostics());
     refreshTocBtn?.addEventListener('click', () => this.refreshBookStructure(false));
     resumeBtn?.addEventListener('click', () => this.handleApplyResume());
+    selectAllTocBtn?.addEventListener('click', () => this.handleSelectAllToc());
+    resetTocBtn?.addEventListener('click', () => this.handleResetTocSelection());
 
-    moduleSelect?.addEventListener('change', () => this.handleModuleSelectionChange());
     startInput?.addEventListener('input', () => this.handleManualRangeEdit());
     endInput?.addEventListener('input', () => this.handleManualRangeEdit());
 
@@ -333,55 +357,39 @@ export class FloatingWidget {
         }
       }
 
-      const selectEl = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
       const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
       const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
 
-      if (!selectEl || !startInput || !endInput) return;
+      if (!startInput || !endInput) return;
 
       const maxCh = structure.totalChapters > 0 ? structure.totalChapters - 1 : 9999;
       startInput.max = String(maxCh);
       endInput.max = String(maxCh);
 
-      selectEl.innerHTML = '';
+      this.selectableModules = getSelectableTocModules(structure.modules);
 
-      if (structure.modules.length > 0) {
-        for (const mod of structure.modules) {
-          const opt = document.createElement('option');
-          opt.value = mod.id;
-          opt.textContent = `${mod.title} (ch ${mod.startChapter}–${mod.endChapter} • ${mod.pageCount} hal)`;
-          selectEl.appendChild(opt);
+      if (this.selectableModules.length > 0) {
+        const defaultIdx = findDefaultTocIndex(this.selectableModules, structure.currentChapter);
+        this.tocSelection = defaultIdx >= 0 ? { startIndex: defaultIdx, endIndex: defaultIdx } : null;
+
+        const computed = computeSelectedChapterRange(this.selectableModules, this.tocSelection);
+        if (computed) {
+          startInput.value = String(computed.startChapter);
+          endInput.value = String(computed.endChapter);
         }
 
-        const customOpt = document.createElement('option');
-        customOpt.value = 'custom';
-        customOpt.textContent = 'Rentang Manual (Custom)';
-        selectEl.appendChild(customOpt);
-
-        const activeModule = this.findModuleForChapter(structure.modules, structure.currentChapter);
-        if (activeModule) {
-          selectEl.value = activeModule.id;
-          startInput.value = String(activeModule.startChapter);
-          endInput.value = String(activeModule.endChapter);
-        } else {
-          selectEl.value = structure.modules[0].id;
-          startInput.value = String(structure.modules[0].startChapter);
-          endInput.value = String(structure.modules[0].endChapter);
-        }
-
+        this.renderTocList(true);
         this.updatePageCountPill();
 
         if (!silent) {
           this.updateStatus(
             'idle',
-            `TOC terdeteksi: ${Math.max(1, structure.modules.length - 1)} bagian, total ${structure.totalChapters} halaman.`
+            `TOC terdeteksi: ${this.selectableModules.length} bagian, total ${structure.totalChapters} halaman.`
           );
         }
       } else {
-        const fallbackOpt = document.createElement('option');
-        fallbackOpt.value = 'custom';
-        fallbackOpt.textContent = 'Rentang Manual (TOC belum termuat)';
-        selectEl.appendChild(fallbackOpt);
+        this.tocSelection = null;
+        this.renderTocList(false);
         startInput.value = String(structure.currentChapter);
         endInput.value = String(structure.currentChapter);
         this.updatePageCountPill();
@@ -398,32 +406,222 @@ export class FloatingWidget {
     }
   }
 
-  private findModuleForChapter(modules: ModuleRange[], currentChapter: number): ModuleRange | null {
-    const specific = modules.find(
-      (m) => !m.isFullBook && currentChapter >= m.startChapter && currentChapter <= m.endChapter
-    );
-    return specific || modules[0] || null;
+  private renderTocList(scrollSelectedIntoView = false): void {
+    const listEl = this.shadowRoot.querySelector('#rbv-toc-list') as HTMLElement | null;
+    if (!listEl) return;
+
+    while (listEl.firstChild) {
+      listEl.removeChild(listEl.firstChild);
+    }
+
+    if (this.selectableModules.length === 0) {
+      const emptyEl = document.createElement('div');
+      emptyEl.className = 'rbv-toc-empty';
+      emptyEl.textContent = 'TOC belum termuat. Gunakan input Dari/Sampai Ch atau klik Pindai TOC.';
+      listEl.appendChild(emptyEl);
+      this.syncTocListUi();
+      return;
+    }
+
+    for (let i = 0; i < this.selectableModules.length; i++) {
+      const mod = this.selectableModules[i];
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'rbv-toc-checkbox';
+      checkbox.setAttribute('data-toc-index', String(i));
+      checkbox.addEventListener('change', () => {
+        this.handleTocItemToggle(i);
+      });
+
+      const titleSpan = document.createElement('span');
+      titleSpan.className = 'rbv-toc-title';
+      titleSpan.textContent = mod.title;
+
+      const metaSpan = document.createElement('span');
+      metaSpan.className = 'rbv-toc-meta';
+      metaSpan.textContent =
+        mod.startChapter === mod.endChapter
+          ? `ch ${mod.startChapter} • 1h`
+          : `ch ${mod.startChapter}–${mod.endChapter} • ${mod.pageCount}h`;
+
+      const row = document.createElement('label');
+      row.className = 'rbv-toc-item';
+      row.setAttribute('data-toc-index', String(i));
+      if (typeof mod.level === 'number' && mod.level >= 2) {
+        row.classList.add('is-sublevel-deep');
+      } else if (typeof mod.level === 'number' && mod.level === 1) {
+        row.classList.add('is-sublevel');
+      }
+
+      row.appendChild(checkbox);
+      row.appendChild(titleSpan);
+      row.appendChild(metaSpan);
+      listEl.appendChild(row);
+    }
+
+    this.syncTocListUi();
+
+    if (scrollSelectedIntoView && this.tocSelection !== null) {
+      const activeRow = listEl.querySelector(
+        `.rbv-toc-item[data-toc-index="${this.tocSelection.startIndex}"]`
+      ) as HTMLElement | null;
+      activeRow?.scrollIntoView({ block: 'nearest' });
+    }
   }
 
-  private handleModuleSelectionChange(): void {
-    const selectEl = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
-    const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
-    const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
-    if (!selectEl || !startInput || !endInput || !this.bookStructure) return;
+  private syncTocListUi(): void {
+    const listEl = this.shadowRoot.querySelector('#rbv-toc-list') as HTMLElement | null;
+    const summaryEl = this.shadowRoot.querySelector('#rbv-toc-summary') as HTMLElement | null;
+    const allBtn = this.shadowRoot.querySelector('#rbv-btn-toc-all') as HTMLButtonElement | null;
+    const resetBtn = this.shadowRoot.querySelector('#rbv-btn-toc-reset') as HTMLButtonElement | null;
+    const ruleHint = this.shadowRoot.querySelector('#rbv-toc-rule-hint') as HTMLElement | null;
 
-    const selected = this.bookStructure.modules.find((m) => m.id === selectEl.value);
-    if (selected) {
-      startInput.value = String(selected.startChapter);
-      endInput.value = String(selected.endChapter);
+    const total = this.selectableModules.length;
+    const computed = computeSelectedChapterRange(this.selectableModules, this.tocSelection);
+
+    if (listEl) {
+      listEl.classList.toggle('is-exporting', this.isExporting);
+      const rows = listEl.querySelectorAll('.rbv-toc-item');
+
+      rows.forEach((rowNode) => {
+        const row = rowNode as HTMLElement;
+        const idx = parseInt(row.getAttribute('data-toc-index') ?? '-1', 10);
+        const mod = this.selectableModules[idx];
+        const checkbox = row.querySelector('.rbv-toc-checkbox') as HTMLInputElement | null;
+        if (!mod || !checkbox) return;
+
+        const state = getTocItemState(idx, total, this.tocSelection);
+        const isSelected = state === 'selected-edge' || state === 'selected-middle';
+        const isLockedMiddle = state === 'selected-middle';
+        const isAdjacent = state === 'adjacent-available';
+        const isDisabledGap = state === 'disabled-gap';
+
+        checkbox.checked = isSelected;
+        checkbox.disabled = this.isExporting || isLockedMiddle || isDisabledGap;
+
+        row.classList.toggle('is-selected', isSelected);
+        row.classList.toggle(
+          'is-range-start',
+          isSelected && this.tocSelection !== null && idx === this.tocSelection.startIndex
+        );
+        row.classList.toggle(
+          'is-range-end',
+          isSelected && this.tocSelection !== null && idx === this.tocSelection.endIndex
+        );
+        row.classList.toggle('is-middle-locked', isLockedMiddle);
+        row.classList.toggle('is-adjacent', isAdjacent);
+        row.classList.toggle('is-disabled-gap', isDisabledGap);
+        row.classList.toggle('is-exporting', this.isExporting);
+
+        const baseMeta = `${mod.title} (ch ${mod.startChapter}–${mod.endChapter} • ${mod.pageCount} hal)`;
+        if (isLockedMiddle) {
+          row.title = `${baseMeta} — Terkunci di tengah rentang terpilih. Lepas dari ujung atas/bawah terlebih dahulu.`;
+        } else if (isDisabledGap) {
+          row.title = `${baseMeta} — Hanya bisa memilih TOC tepat di atas/bawah rentang terpilih. Klik Reset untuk mulai dari bagian lain.`;
+        } else if (isAdjacent) {
+          row.title = `${baseMeta} — Klik untuk menambahkan ke rentang terpilih.`;
+        } else if (isSelected && this.tocSelection && this.tocSelection.startIndex === this.tocSelection.endIndex) {
+          row.title = `${baseMeta} — Klik lagi untuk melepas pilihan.`;
+        } else if (isSelected) {
+          row.title = `${baseMeta} — Klik untuk melepas dari ujung rentang.`;
+        } else {
+          row.title = baseMeta;
+        }
+      });
+    }
+
+    if (summaryEl) {
+      if (total === 0 || !computed) {
+        summaryEl.textContent = 'Rentang Manual';
+        summaryEl.classList.add('is-manual');
+      } else if (computed.isFullBook) {
+        summaryEl.textContent = `Seluruh Buku (${computed.selectedCount} TOC)`;
+        summaryEl.classList.remove('is-manual');
+      } else if (computed.selectedCount === 1) {
+        summaryEl.textContent = '1 TOC dipilih';
+        summaryEl.classList.remove('is-manual');
+      } else {
+        summaryEl.textContent = `${computed.selectedCount} TOC dipilih`;
+        summaryEl.classList.remove('is-manual');
+      }
+    }
+
+    const isAllSelected =
+      total > 0 &&
+      this.tocSelection !== null &&
+      this.tocSelection.startIndex === 0 &&
+      this.tocSelection.endIndex === total - 1;
+
+    if (allBtn) {
+      allBtn.disabled = this.isExporting || total === 0 || isAllSelected;
+    }
+    if (resetBtn) {
+      resetBtn.disabled = this.isExporting || total === 0 || this.tocSelection === null;
+    }
+
+    if (ruleHint) {
+      if (total === 0) {
+        ruleHint.textContent = 'Isi Dari/Sampai Ch secara manual atau klik Pindai TOC.';
+      } else if (this.tocSelection === null) {
+        ruleHint.textContent = 'Semua TOC terbuka — klik TOC mana pun untuk mulai rentang baru.';
+      } else {
+        ruleHint.textContent = 'Hanya TOC tepat di atas/bawah yang bisa ditambah (1 kesatuan tanpa lompat).';
+      }
+    }
+  }
+
+  private handleTocItemToggle(index: number): void {
+    if (this.isExporting) return;
+
+    const result = toggleTocItemSelection(this.tocSelection, index, this.selectableModules.length);
+    if (!result.changed) {
+      this.syncTocListUi();
+      return;
+    }
+
+    this.tocSelection = result.selection;
+    const computed = computeSelectedChapterRange(this.selectableModules, this.tocSelection);
+
+    if (computed) {
+      const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
+      const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
+      if (startInput) startInput.value = String(computed.startChapter);
+      if (endInput) endInput.value = String(computed.endChapter);
       this.updatePageCountPill();
     }
+
+    this.syncTocListUi();
+  }
+
+  private handleSelectAllToc(): void {
+    if (this.isExporting || this.selectableModules.length === 0) return;
+
+    this.tocSelection = selectAllTocItems(this.selectableModules.length);
+    const computed = computeSelectedChapterRange(this.selectableModules, this.tocSelection);
+    if (computed) {
+      const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
+      const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
+      if (startInput) startInput.value = String(computed.startChapter);
+      if (endInput) endInput.value = String(computed.endChapter);
+      this.updatePageCountPill();
+    }
+    this.syncTocListUi();
+  }
+
+  private handleResetTocSelection(): void {
+    if (this.isExporting) return;
+    this.tocSelection = null;
+    this.syncTocListUi();
   }
 
   private handleManualRangeEdit(): void {
-    const selectEl = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
-    if (selectEl && selectEl.querySelector('option[value="custom"]')) {
-      selectEl.value = 'custom';
-    }
+    const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
+    const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
+    const start = parseInt(startInput?.value ?? '', 10);
+    const end = parseInt(endInput?.value ?? '', 10);
+
+    this.tocSelection = matchSelectionFromChapterRange(this.selectableModules, start, end);
+    this.syncTocListUi();
     this.updatePageCountPill();
   }
 
@@ -642,7 +840,6 @@ export class FloatingWidget {
 
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
-    const selectEl = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
     const savePerPageChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
     const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
     const timeoutInput = this.shadowRoot.querySelector('#rbv-adv-timeout') as HTMLInputElement | null;
@@ -657,8 +854,18 @@ export class FloatingWidget {
 
     const structure = TocParser.getBookStructure();
     this.bookStructure = structure;
-    const selectedModule = structure.modules.find((m) => m.id === selectEl?.value);
-    const label = selectedModule ? selectedModule.title : `Rentang Ch ${startChapter}–${endChapter}`;
+    const latestSelectable = getSelectableTocModules(structure.modules);
+    const computedFromState = computeSelectedChapterRange(this.selectableModules, this.tocSelection);
+    const resolvedRange =
+      computedFromState &&
+      computedFromState.startChapter === startChapter &&
+      computedFromState.endChapter === endChapter
+        ? computedFromState
+        : computeSelectedChapterRange(
+            latestSelectable,
+            matchSelectionFromChapterRange(latestSelectable, startChapter, endChapter)
+          );
+    const label = resolvedRange ? resolvedRange.label : `Rentang Ch ${startChapter}–${endChapter}`;
 
     const chapterTitles: Record<number, string> = {};
     for (const item of structure.tocItems) {
@@ -772,13 +979,17 @@ export class FloatingWidget {
     if (this.pendingResumeChapter === null) return;
 
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
-    const selectEl = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
+    const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
     if (startInput) {
       startInput.value = String(this.pendingResumeChapter);
     }
-    if (selectEl && selectEl.querySelector('option[value="custom"]')) {
-      selectEl.value = 'custom';
-    }
+    const end = parseInt(endInput?.value ?? '', 10);
+    this.tocSelection = matchSelectionFromChapterRange(
+      this.selectableModules,
+      this.pendingResumeChapter,
+      end
+    );
+    this.syncTocListUi();
     this.updatePageCountPill();
     this.hideResumeBanner();
     void this.handleStart();
@@ -1099,7 +1310,6 @@ export class FloatingWidget {
     const stopBtn = this.shadowRoot.querySelector('#rbv-btn-stop') as HTMLButtonElement | null;
     const diagBtn = this.shadowRoot.querySelector('#rbv-btn-diag') as HTMLButtonElement | null;
     const refreshBtn = this.shadowRoot.querySelector('#rbv-btn-refresh-toc') as HTMLButtonElement | null;
-    const moduleSelect = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
     const saveChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
@@ -1109,12 +1319,12 @@ export class FloatingWidget {
     if (testPrintBtn) testPrintBtn.disabled = exporting;
     if (diagBtn) diagBtn.disabled = exporting;
     if (refreshBtn) refreshBtn.disabled = exporting;
-    if (moduleSelect) moduleSelect.disabled = exporting;
     if (startInput) startInput.disabled = exporting;
     if (endInput) endInput.disabled = exporting;
     if (saveChk) saveChk.disabled = exporting;
     if (retriesInput) retriesInput.disabled = exporting;
     if (timeoutInput) timeoutInput.disabled = exporting;
+    this.syncTocListUi();
 
     if (startBtn) startBtn.style.display = exporting ? 'none' : 'flex';
     if (stopBtn) stopBtn.style.display = exporting ? 'flex' : 'none';
