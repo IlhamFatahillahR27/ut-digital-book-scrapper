@@ -148,7 +148,7 @@ export class TocParser {
     }
 
     // 3. Build contiguous ranges for each top-level section
-    if (sectionStarts.length > 0 && sectionStarts.length < tocItems.length) {
+    if (sectionStarts.length > 0 && (sectionStarts.length < tocItems.length || sectionStarts.length <= 50)) {
       // If first section starts after chapter 0, add an initial front-matter range
       if (sectionStarts[0].chapterIndex > 0) {
         const end = sectionStarts[0].chapterIndex - 1;
@@ -157,7 +157,8 @@ export class TocParser {
           title: tocItems[0]?.title || 'Halaman Awal',
           startChapter: 0,
           endChapter: end,
-          pageCount: end + 1
+          pageCount: end + 1,
+          level: 0
         });
       }
 
@@ -172,7 +173,8 @@ export class TocParser {
           title: current.title,
           startChapter,
           endChapter,
-          pageCount: endChapter - startChapter + 1
+          pageCount: endChapter - startChapter + 1,
+          level: Math.max(0, current.level - minLevel)
         });
       }
     }

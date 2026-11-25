@@ -1,8 +1,8 @@
 # Privacy Policy — RBV-UT to PDF Exporter
 
-**Effective Date:** November 24, 2026  
+**Effective Date:** November 25, 2026  
 **Extension Name:** RBV-UT to PDF Exporter  
-**Version:** 1.0.0  
+**Version:** 1.1.0  
 
 ---
 
