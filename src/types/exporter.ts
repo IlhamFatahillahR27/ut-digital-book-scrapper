@@ -1,3 +1,7 @@
+import type { ExportMode, VectorSaveStatus } from './capture';
+
+export type { ExportMode, VectorSaveStatus };
+
 export type ExporterStatus =
   | 'IDLE'
   | 'INITIALIZING'
@@ -52,11 +56,10 @@ export interface ExportRangeRequest {
   bookId?: string | null;
   bookTitle?: string;
   bookAuthor?: string | null;
-  /** Debug option: also download each captured chapter PDF individually */
-  savePerPageDebug?: boolean;
+  exportMode?: ExportMode;
   /** Optional chapter title lookup map (chapterIndex -> title from TOC) */
   chapterTitles?: Record<number, string>;
-  /** Filtered TOC items within this export range for hierarchical PDF bookmarks */
+  /** Filtered TOC items within this export range */
   tocItems?: TocItem[];
 }
 
@@ -81,6 +84,7 @@ export interface FailedChapterMeta {
 
 export interface BatchExportSummary {
   status: 'COMPLETED' | 'STOPPED' | 'ERROR';
+  exportMode: ExportMode;
   label: string;
   startChapter: number;
   endChapter: number;
@@ -95,13 +99,10 @@ export interface BatchExportSummary {
   resumeFromChapter?: number | null;
   elapsedMs?: number;
   errorMessage?: string;
-  /** Phase 4 stitched PDF output details */
   outputFilename?: string;
-  outputBytes?: number;
   totalPdfPages?: number;
-  bookmarkCount?: number;
   isPartial?: boolean;
-  downloadId?: number;
+  vectorSaveStatus?: VectorSaveStatus;
 }
 
 export interface ExportProgress {
@@ -131,10 +132,11 @@ export interface ExporterConfig {
   renderWaitMs: number;
   paperFormat: 'A4' | 'Letter';
   printBackground: boolean;
+  exportMode: ExportMode;
   chapterNavigationTimeoutMs: number;
   domQuiescenceMs: number;
   maxRetriesPerChapter: number;
-  cdpPrintTimeoutMs: number;
+  savePdfTimeoutMs: number;
   preparePrintTimeoutMs: number;
   retryBaseDelayMs: number;
   maxConsecutiveFailures: number;
@@ -146,10 +148,11 @@ export const DEFAULT_EXPORTER_CONFIG: ExporterConfig = {
   renderWaitMs: 2000,
   paperFormat: 'A4',
   printBackground: true,
+  exportMode: 'native-vector',
   chapterNavigationTimeoutMs: 20000,
   domQuiescenceMs: 450,
   maxRetriesPerChapter: 2,
-  cdpPrintTimeoutMs: 35000,
+  savePdfTimeoutMs: 180000,
   preparePrintTimeoutMs: 15000,
   retryBaseDelayMs: 1200,
   maxConsecutiveFailures: 3,
@@ -160,7 +163,6 @@ export interface WidgetPreferences {
   left?: number;
   top?: number;
   minimized?: boolean;
-  savePerPageDebug?: boolean;
   maxRetriesPerChapter?: number;
   chapterNavigationTimeoutMs?: number;
 }

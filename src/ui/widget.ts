@@ -1,6 +1,7 @@
 import widgetCss from './widget.css?inline';
 import { DomDetector } from '../content/dom-detector';
 import { TocParser } from '../content/toc-parser';
+import { getBrowserApi } from '../utils/browser-api';
 import { logger } from '../utils/logger';
 import { loadWidgetPreferences, saveWidgetPreferences } from '../utils/storage';
 import {
@@ -21,13 +22,39 @@ import type {
 
 const LARGE_RANGE_ADVISORY_THRESHOLD = 100;
 
+/**
+ * Safe DOM element builder (zero `.innerHTML`) for Mozilla AMO `addons-linter` compliance.
+ */
+function createEl<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  attrs?: Record<string, string>,
+  children?: Array<Node | string>
+): HTMLElementTagNameMap[K] {
+  const el = document.createElement(tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      el.setAttribute(k, v);
+    }
+  }
+  if (children) {
+    for (const child of children) {
+      if (typeof child === 'string') {
+        el.appendChild(document.createTextNode(child));
+      } else {
+        el.appendChild(child);
+      }
+    }
+  }
+  return el;
+}
+
 export class FloatingWidget {
   private shadowRoot: ShadowRoot;
   private isExporting = false;
   private isMinimized = false;
   private currentTitle = '';
   private pollIntervalId: number | null = null;
-  private keepAlivePort: chrome.runtime.Port | null = null;
+  private keepAlivePort: browser.runtime.Port | null = null;
   private bookStructure: BookStructureInfo | null = null;
   private pendingResumeChapter: number | null = null;
   private appVersion = '1.0.0';
@@ -35,7 +62,7 @@ export class FloatingWidget {
   constructor(shadowRoot: ShadowRoot) {
     this.shadowRoot = shadowRoot;
     try {
-      this.appVersion = chrome.runtime.getManifest?.().version || '1.0.0';
+      this.appVersion = getBrowserApi().runtime.getManifest?.().version || '1.0.0';
     } catch {
       this.appVersion = '1.0.0';
     }
@@ -51,7 +78,6 @@ export class FloatingWidget {
     void this.restorePreferences();
     void this.rehydrateActiveExportStatus();
 
-    // Re-scan TOC shortly after initial mount in case Kotobee SPA finishes hydrating asynchronously
     window.setTimeout(() => {
       if (!this.isExporting && (!this.bookStructure || this.bookStructure.modules.length === 0)) {
         this.refreshBookStructure(true);
@@ -66,128 +92,198 @@ export class FloatingWidget {
   }
 
   private render(): void {
-    const iconUrl = chrome.runtime.getURL('icons/icon-48.png');
+    const iconUrl = getBrowserApi().runtime.getURL('icons/icon-48.png');
 
-    this.shadowRoot.innerHTML = `
-      <style>${widgetCss}</style>
-      <div class="rbv-card" id="rbv-card">
-        <div class="rbv-header" id="rbv-header">
-          <div class="rbv-title">
-            <img src="${iconUrl}" width="20" height="20" style="border-radius: 4px; object-fit: contain; background: #ffffff; padding: 1px;" alt="UT" />
-            <span>RBV-UT Exporter</span>
-          </div>
-          <div class="rbv-header-actions">
-            <span class="rbv-header-pct" id="rbv-header-pct">0%</span>
-            <span class="rbv-badge">MV3</span>
-            <button class="rbv-icon-btn" id="rbv-btn-toggle" title="Perkecil / Perbesar panel">−</button>
-          </div>
-          <div class="rbv-mini-progress">
-            <div class="rbv-mini-progress-fill" id="rbv-mini-progress-fill"></div>
-          </div>
-        </div>
-        <div class="rbv-body">
-          <div class="rbv-book-info">
-            <div class="rbv-book-label">Buku Terdeteksi</div>
-            <div class="rbv-book-title" id="rbv-title-display" title="${this.escapeHtml(this.currentTitle)}">
-              ${this.escapeHtml(this.currentTitle)}
-            </div>
-          </div>
+    while (this.shadowRoot.firstChild) {
+      this.shadowRoot.removeChild(this.shadowRoot.firstChild);
+    }
 
-          <div class="rbv-range-panel">
-            <div class="rbv-range-header">
-              <span class="rbv-book-label">Modul / Rentang Halaman</span>
-              <button class="rbv-refresh-btn" id="rbv-btn-refresh-toc" title="Pindai ulang Daftar Isi (TOC) Kotobee">↻ Pindai TOC</button>
-            </div>
-            <select class="rbv-select" id="rbv-module-select">
-              <option value="custom">Memindai Daftar Isi Kotobee...</option>
-            </select>
-            <div class="rbv-range-inputs">
-              <div class="rbv-input-group">
-                <span class="rbv-input-label">Dari Ch</span>
-                <input type="number" min="0" value="0" class="rbv-num-input" id="rbv-start-ch" />
-              </div>
-              <span class="rbv-range-sep">–</span>
-              <div class="rbv-input-group">
-                <span class="rbv-input-label">Sampai Ch</span>
-                <input type="number" min="0" value="0" class="rbv-num-input" id="rbv-end-ch" />
-              </div>
-              <span class="rbv-page-pill" id="rbv-page-count-pill">1 hal</span>
-            </div>
-            <div class="rbv-advisory-tip" id="rbv-advisory-tip">
-              💡 Tip: Untuk buku &gt;${LARGE_RANGE_ADVISORY_THRESHOLD} halaman, mengekspor per Modul lebih cepat &amp; lebih hemat memori.
-            </div>
-          </div>
+    const styleEl = document.createElement('style');
+    styleEl.textContent = widgetCss;
 
-          <div class="rbv-progress-card" id="rbv-progress-card">
-            <div class="rbv-progress-top">
-              <span class="rbv-phase-badge" id="rbv-phase-badge">Siap</span>
-              <span class="rbv-progress-pct" id="rbv-progress-pct">0%</span>
-            </div>
-            <div class="rbv-progress-track">
-              <div class="rbv-progress-fill" id="rbv-progress-fill"></div>
-            </div>
-            <div class="rbv-progress-headline" id="rbv-progress-headline">Menyiapkan ekspor...</div>
-            <div class="rbv-progress-sub" id="rbv-progress-sub"></div>
-            <div class="rbv-telemetry-row">
-              <span id="rbv-telemetry-left">0.00 MB</span>
-              <span class="rbv-skip-pill" id="rbv-skip-pill">⚠ 0 dilewati</span>
-              <span id="rbv-telemetry-right">Estimasi: —</span>
-            </div>
-          </div>
+    const iconImg = createEl('img', {
+      src: iconUrl,
+      width: '20',
+      height: '20',
+      alt: 'UT',
+      style: 'border-radius: 4px; object-fit: contain; background: #ffffff; padding: 1px;'
+    });
 
-          <div class="rbv-resume-banner" id="rbv-resume-banner">
-            <div id="rbv-resume-text">Ekspor terhenti di tengah proses.</div>
-            <button class="rbv-btn-resume" id="rbv-btn-resume">▶ Lanjutkan dari Ch 0</button>
-          </div>
+    const header = createEl('div', { class: 'rbv-header', id: 'rbv-header' }, [
+      createEl('div', { class: 'rbv-title' }, [iconImg, createEl('span', undefined, ['RBV-UT Exporter'])]),
+      createEl('div', { class: 'rbv-header-actions' }, [
+        createEl('span', { class: 'rbv-header-pct', id: 'rbv-header-pct' }, ['0%']),
+        createEl('span', { class: 'rbv-badge' }, ['Firefox']),
+        createEl('button', { class: 'rbv-icon-btn', id: 'rbv-btn-toggle', title: 'Perkecil / Perbesar panel' }, ['−'])
+      ]),
+      createEl('div', { class: 'rbv-mini-progress' }, [
+        createEl('div', { class: 'rbv-mini-progress-fill', id: 'rbv-mini-progress-fill' })
+      ])
+    ]);
 
-          <div class="rbv-status-row">
-            <span class="rbv-status-dot" id="rbv-status-dot"></span>
-            <span id="rbv-status-text">Siap. Pilih modul atau rentang chapter di atas.</span>
-          </div>
+    const bookInfo = createEl('div', { class: 'rbv-book-info' }, [
+      createEl('div', { class: 'rbv-book-label' }, ['Buku Terdeteksi']),
+      createEl(
+        'div',
+        { class: 'rbv-book-title', id: 'rbv-title-display', title: this.currentTitle },
+        [this.currentTitle]
+      )
+    ]);
 
-          <div class="rbv-actions">
-            <button class="rbv-btn rbv-btn-primary" id="rbv-btn-start" title="Ekspor rentang terpilih menjadi 1 file PDF utuh dengan Bookmarks/Daftar Isi">
-              🚀 Ekspor ke 1 File PDF
-            </button>
-            <button class="rbv-btn rbv-btn-danger" id="rbv-btn-stop" style="display: none;">
-              ⏹ Berhenti &amp; Simpan Parsial
-            </button>
-            <button class="rbv-btn rbv-btn-secondary" id="rbv-btn-test-print" title="Cetak halaman yang sedang Anda buka saat ini menjadi 1 file PDF">
-              📄 Cetak Halaman Aktif
-            </button>
-          </div>
+    const moduleSelect = createEl('select', { class: 'rbv-select', id: 'rbv-module-select' }, [
+      createEl('option', { value: 'custom' }, ['Memindai Daftar Isi Kotobee...'])
+    ]);
 
-          <details class="rbv-advanced" id="rbv-advanced-drawer">
-            <summary class="rbv-advanced-summary">
-              <span>⚙ Alat Lanjutan &amp; Diagnostik</span>
-              <span class="rbv-advanced-caret">▼</span>
-            </summary>
-            <div class="rbv-advanced-body">
-              <div class="rbv-adv-grid">
-                <div class="rbv-input-group">
-                  <span class="rbv-input-label">Maks Retry / hal</span>
-                  <input type="number" min="0" max="4" value="${DEFAULT_EXPORTER_CONFIG.maxRetriesPerChapter}" class="rbv-num-input" id="rbv-adv-retries" />
-                </div>
-                <div class="rbv-input-group">
-                  <span class="rbv-input-label">Timeout (dtk)</span>
-                  <input type="number" min="10" max="60" value="${Math.round(DEFAULT_EXPORTER_CONFIG.chapterNavigationTimeoutMs / 1000)}" class="rbv-num-input" id="rbv-adv-timeout" />
-                </div>
-              </div>
-              <label class="rbv-checkbox-row" title="Selain menghasilkan 1 PDF gabungan ber-bookmark, simpan juga salinan PDF terpisah untuk setiap halaman">
-                <input type="checkbox" id="rbv-chk-save-per-page" />
-                <span>Simpan salinan PDF per halaman (Debug)</span>
-              </label>
-              <button class="rbv-btn rbv-btn-outline" id="rbv-btn-diag" title="Salin struktur DOM & TOC Kotobee ke clipboard untuk analisis">
-                🔍 Salin Diagnostik DOM
-              </button>
-            </div>
-          </details>
-        </div>
-        <div class="rbv-footer">
-          Optimized for NotebookLM • v${this.escapeHtml(this.appVersion)}
-        </div>
-      </div>
-    `;
+    const rangePanel = createEl('div', { class: 'rbv-range-panel' }, [
+      createEl('div', { class: 'rbv-range-header' }, [
+        createEl('span', { class: 'rbv-book-label' }, ['Modul / Rentang Halaman']),
+        createEl(
+          'button',
+          { class: 'rbv-refresh-btn', id: 'rbv-btn-refresh-toc', title: 'Pindai ulang Daftar Isi (TOC) Kotobee' },
+          ['↻ Pindai TOC']
+        )
+      ]),
+      moduleSelect,
+      createEl('div', { class: 'rbv-range-inputs' }, [
+        createEl('div', { class: 'rbv-input-group' }, [
+          createEl('span', { class: 'rbv-input-label' }, ['Dari Ch']),
+          createEl('input', { type: 'number', min: '0', value: '0', class: 'rbv-num-input', id: 'rbv-start-ch' })
+        ]),
+        createEl('span', { class: 'rbv-range-sep' }, ['–']),
+        createEl('div', { class: 'rbv-input-group' }, [
+          createEl('span', { class: 'rbv-input-label' }, ['Sampai Ch']),
+          createEl('input', { type: 'number', min: '0', value: '0', class: 'rbv-num-input', id: 'rbv-end-ch' })
+        ]),
+        createEl('span', { class: 'rbv-page-pill', id: 'rbv-page-count-pill' }, ['1 hal'])
+      ]),
+      createEl('div', { class: 'rbv-advisory-tip', id: 'rbv-advisory-tip' }, [
+        `💡 Tip: Untuk buku >${LARGE_RANGE_ADVISORY_THRESHOLD} halaman, mengekspor per Modul lebih cepat & lebih hemat memori.`
+      ])
+    ]);
+
+    const modeInfo = createEl('div', { class: 'rbv-mode-panel' }, [
+      createEl('span', { class: 'rbv-book-label' }, ['Mode Ekspor: Vektor Native Firefox']),
+      createEl('div', { class: 'rbv-mode-hint vector-note' }, [
+        'Teks vektor tajam & searchable (NotebookLM) dengan 1x dialog Save As di akhir.'
+      ])
+    ]);
+
+    const progressCard = createEl('div', { class: 'rbv-progress-card', id: 'rbv-progress-card' }, [
+      createEl('div', { class: 'rbv-progress-top' }, [
+        createEl('span', { class: 'rbv-phase-badge', id: 'rbv-phase-badge' }, ['Siap']),
+        createEl('span', { class: 'rbv-progress-pct', id: 'rbv-progress-pct' }, ['0%'])
+      ]),
+      createEl('div', { class: 'rbv-progress-track' }, [
+        createEl('div', { class: 'rbv-progress-fill', id: 'rbv-progress-fill' })
+      ]),
+      createEl('div', { class: 'rbv-progress-headline', id: 'rbv-progress-headline' }, ['Menyiapkan ekspor...']),
+      createEl('div', { class: 'rbv-progress-sub', id: 'rbv-progress-sub' }),
+      createEl('div', { class: 'rbv-telemetry-row' }, [
+        createEl('span', { id: 'rbv-telemetry-left' }, ['0 hal']),
+        createEl('span', { class: 'rbv-skip-pill', id: 'rbv-skip-pill' }, ['⚠ 0 dilewati']),
+        createEl('span', { id: 'rbv-telemetry-right' }, ['Estimasi: —'])
+      ])
+    ]);
+
+    const resumeBanner = createEl('div', { class: 'rbv-resume-banner', id: 'rbv-resume-banner' }, [
+      createEl('div', { id: 'rbv-resume-text' }, ['Ekspor terhenti di tengah proses.']),
+      createEl('button', { class: 'rbv-btn-resume', id: 'rbv-btn-resume' }, ['▶ Lanjutkan dari Ch 0'])
+    ]);
+
+    const statusRow = createEl('div', { class: 'rbv-status-row' }, [
+      createEl('span', { class: 'rbv-status-dot', id: 'rbv-status-dot' }),
+      createEl('span', { id: 'rbv-status-text' }, ['Siap. Pilih modul atau rentang chapter di atas.'])
+    ]);
+
+    const stopBtn = createEl(
+      'button',
+      { class: 'rbv-btn rbv-btn-danger', id: 'rbv-btn-stop', style: 'display: none;' },
+      ['⏹ Berhenti & Simpan Parsial']
+    );
+
+    const actions = createEl('div', { class: 'rbv-actions' }, [
+      createEl(
+        'button',
+        {
+          class: 'rbv-btn rbv-btn-primary',
+          id: 'rbv-btn-start',
+          title: 'Kumpulkan seluruh rentang terpilih menjadi 1 file PDF vektor utuh (1x dialog Save As)'
+        },
+        ['🚀 Ekspor ke 1 File PDF']
+      ),
+      stopBtn,
+      createEl(
+        'button',
+        {
+          class: 'rbv-btn rbv-btn-secondary',
+          id: 'rbv-btn-test-print',
+          title: 'Cetak halaman yang sedang Anda buka saat ini menjadi 1 file PDF vektor'
+        },
+        ['📄 Cetak Halaman Aktif']
+      )
+    ]);
+
+    const advDrawer = createEl('details', { class: 'rbv-advanced', id: 'rbv-advanced-drawer' }, [
+      createEl('summary', { class: 'rbv-advanced-summary' }, [
+        createEl('span', undefined, ['⚙ Alat Lanjutan & Diagnostik']),
+        createEl('span', { class: 'rbv-advanced-caret' }, ['▼'])
+      ]),
+      createEl('div', { class: 'rbv-advanced-body' }, [
+        createEl('div', { class: 'rbv-adv-grid' }, [
+          createEl('div', { class: 'rbv-input-group' }, [
+            createEl('span', { class: 'rbv-input-label' }, ['Maks Retry / hal']),
+            createEl('input', {
+              type: 'number',
+              min: '0',
+              max: '4',
+              value: String(DEFAULT_EXPORTER_CONFIG.maxRetriesPerChapter),
+              class: 'rbv-num-input',
+              id: 'rbv-adv-retries'
+            })
+          ]),
+          createEl('div', { class: 'rbv-input-group' }, [
+            createEl('span', { class: 'rbv-input-label' }, ['Timeout (dtk)']),
+            createEl('input', {
+              type: 'number',
+              min: '10',
+              max: '60',
+              value: String(Math.round(DEFAULT_EXPORTER_CONFIG.chapterNavigationTimeoutMs / 1000)),
+              class: 'rbv-num-input',
+              id: 'rbv-adv-timeout'
+            })
+          ])
+        ]),
+        createEl(
+          'button',
+          {
+            class: 'rbv-btn rbv-btn-outline',
+            id: 'rbv-btn-diag',
+            title: 'Salin struktur DOM & TOC Kotobee ke clipboard untuk analisis'
+          },
+          ['🔍 Salin Diagnostik DOM']
+        )
+      ])
+    ]);
+
+    const body = createEl('div', { class: 'rbv-body' }, [
+      bookInfo,
+      rangePanel,
+      modeInfo,
+      progressCard,
+      resumeBanner,
+      statusRow,
+      actions,
+      advDrawer
+    ]);
+
+    const footer = createEl('div', { class: 'rbv-footer' }, [
+      `Optimized for NotebookLM • Firefox v${this.appVersion}`
+    ]);
+
+    const card = createEl('div', { class: 'rbv-card', id: 'rbv-card' }, [header, body, footer]);
+
+    this.shadowRoot.appendChild(styleEl);
+    this.shadowRoot.appendChild(card);
   }
 
   private bindEvents(): void {
@@ -201,14 +297,13 @@ export class FloatingWidget {
     const moduleSelect = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
-    const saveChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
     const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
     const timeoutInput = this.shadowRoot.querySelector('#rbv-adv-timeout') as HTMLInputElement | null;
 
-    testPrintBtn?.addEventListener('click', () => this.handleTestPrint());
-    startBtn?.addEventListener('click', () => this.handleStart());
-    stopBtn?.addEventListener('click', () => this.handleStop());
-    diagBtn?.addEventListener('click', () => this.handleCopyDiagnostics());
+    testPrintBtn?.addEventListener('click', () => void this.handleTestPrint());
+    startBtn?.addEventListener('click', () => void this.handleStart());
+    stopBtn?.addEventListener('click', () => void this.handleStop());
+    diagBtn?.addEventListener('click', () => void this.handleCopyDiagnostics());
     refreshTocBtn?.addEventListener('click', () => this.refreshBookStructure(false));
     resumeBtn?.addEventListener('click', () => this.handleApplyResume());
 
@@ -216,9 +311,6 @@ export class FloatingWidget {
     startInput?.addEventListener('input', () => this.handleManualRangeEdit());
     endInput?.addEventListener('input', () => this.handleManualRangeEdit());
 
-    saveChk?.addEventListener('change', () => {
-      void saveWidgetPreferences({ savePerPageDebug: !!saveChk.checked });
-    });
     retriesInput?.addEventListener('change', () => {
       const val = this.clampInt(retriesInput.value, 0, 4, DEFAULT_EXPORTER_CONFIG.maxRetriesPerChapter);
       retriesInput.value = String(val);
@@ -236,9 +328,6 @@ export class FloatingWidget {
     });
   }
 
-  /**
-   * Restores saved widget position, minimized state, and advanced settings from chrome.storage.local
-   */
   private async restorePreferences(): Promise<void> {
     const prefs = await loadWidgetPreferences();
     const host = this.shadowRoot.host as HTMLElement | null;
@@ -258,11 +347,6 @@ export class FloatingWidget {
       this.setMinimized(prefs.minimized, false);
     }
 
-    const saveChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
-    if (saveChk && typeof prefs.savePerPageDebug === 'boolean') {
-      saveChk.checked = prefs.savePerPageDebug;
-    }
-
     const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
     if (retriesInput && typeof prefs.maxRetriesPerChapter === 'number') {
       retriesInput.value = String(
@@ -277,12 +361,11 @@ export class FloatingWidget {
     }
   }
 
-  /**
-   * Rehydrates live progress if widget was re-mounted during an already active export
-   */
   private async rehydrateActiveExportStatus(): Promise<void> {
     try {
-      const res = (await chrome.runtime.sendMessage({ type: 'GET_STATUS' })) as StatusResponseMessage;
+      const res = (await getBrowserApi().runtime.sendMessage({
+        type: 'GET_STATUS'
+      })) as StatusResponseMessage;
       if (res?.type === 'STATUS_RESPONSE' && res.payload) {
         const s = res.payload.status;
         if (
@@ -305,9 +388,6 @@ export class FloatingWidget {
     }
   }
 
-  /**
-   * Called by content/index.ts when user clicks the browser extension toolbar icon
-   */
   toggleVisibilityOrExpand(): void {
     if (this.isMinimized) {
       this.setMinimized(false, true);
@@ -316,9 +396,6 @@ export class FloatingWidget {
     }
   }
 
-  /**
-   * Scans Kotobee TOC and populates the Module dropdown & Start/End inputs
-   */
   private refreshBookStructure(silent: boolean): void {
     try {
       const structure = TocParser.getBookStructure();
@@ -343,7 +420,9 @@ export class FloatingWidget {
       startInput.max = String(maxCh);
       endInput.max = String(maxCh);
 
-      selectEl.innerHTML = '';
+      while (selectEl.firstChild) {
+        selectEl.removeChild(selectEl.firstChild);
+      }
 
       if (structure.modules.length > 0) {
         for (const mod of structure.modules) {
@@ -546,9 +625,6 @@ export class FloatingWidget {
     });
   }
 
-  /**
-   * Action: Copies detailed DOM diagnostic report to clipboard
-   */
   private async handleCopyDiagnostics(): Promise<void> {
     try {
       const report = DomDetector.getDiagnosticReport();
@@ -561,13 +637,10 @@ export class FloatingWidget {
       this.updateStatus('idle', '✅ Diagnostik DOM + TOC berhasil disalin ke clipboard.');
     } catch (err) {
       logger.error('Failed to copy diagnostics:', err);
-      this.updateStatus('idle', 'Diagnostik dicetak di DevTools Console (F12).');
+      this.updateStatus('idle', 'Diagnostik dicetak di Web Console (F12).');
     }
   }
 
-  /**
-   * Action: Single active page clean PDF export
-   */
   private async handleTestPrint(): Promise<void> {
     if (this.isExporting) return;
 
@@ -583,7 +656,7 @@ export class FloatingWidget {
       moduleLabel: 'Halaman Aktif',
       phaseLabel: 'Inisialisasi',
       percent: 10,
-      message: 'Menyiapkan cetak halaman aktif...'
+      message: 'Menyiapkan cetak vektor halaman aktif...'
     });
     this.startProgressPolling();
 
@@ -599,21 +672,43 @@ export class FloatingWidget {
     };
 
     try {
-      const response = await chrome.runtime.sendMessage(message);
+      const response = (await getBrowserApi().runtime.sendMessage(message)) as {
+        success?: boolean;
+        filename?: string;
+        vectorSaveStatus?: string;
+        error?: string;
+        message?: string;
+      };
       logger.info('Single page print response:', response);
 
       this.finishExportSession();
 
       if (response?.success) {
+        const msg =
+          response.vectorSaveStatus === 'fallback-print'
+            ? '✅ Dialog cetak sistem dibuka — pilih "Save to PDF".'
+            : `✅ Berhasil! ${response.filename || 'PDF'} (Vektor) tersimpan.`;
         this.renderProgressCard({
           status: 'COMPLETED',
           currentChapter: 1,
           totalChaptersEstimated: 1,
+          capturedCount: 1,
           chapterTitle,
           moduleLabel: 'Halaman Aktif',
           phaseLabel: 'Selesai',
           percent: 100,
-          message: `✅ Berhasil! ${response.filename || 'PDF'} (${response.fileSizeMb || '0'} MB) diunduh.`
+          message: msg
+        });
+      } else if (response?.vectorSaveStatus === 'canceled') {
+        this.renderProgressCard({
+          status: 'STOPPED',
+          currentChapter: 0,
+          totalChaptersEstimated: 1,
+          chapterTitle,
+          moduleLabel: 'Halaman Aktif',
+          phaseLabel: 'Dibatalkan',
+          percent: 0,
+          message: '⏹ Penyimpanan PDF dibatalkan pengguna.'
         });
       } else {
         this.renderProgressCard({
@@ -624,26 +719,22 @@ export class FloatingWidget {
           moduleLabel: 'Halaman Aktif',
           phaseLabel: 'Error',
           percent: 0,
-          message: `❌ Gagal: ${response?.error || 'Cetak halaman aktif gagal.'}`
+          message: `❌ ${response?.error || response?.message || 'Cetak halaman aktif gagal.'}`
         });
       }
     } catch (err) {
       logger.error('Failed to execute single page print:', err);
       this.finishExportSession();
-      this.updateStatus('error', 'Gagal berkomunikasi dengan background service worker.');
+      this.updateStatus('error', 'Gagal berkomunikasi dengan background script ekstensi.');
     }
   }
 
-  /**
-   * Action: Multi-chapter module / page-range export into 1 stitched PDF with Bookmarks
-   */
   private async handleStart(): Promise<void> {
     if (this.isExporting) return;
 
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
     const selectEl = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
-    const savePerPageChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
     const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
     const timeoutInput = this.shadowRoot.querySelector('#rbv-adv-timeout') as HTMLInputElement | null;
 
@@ -697,7 +788,7 @@ export class FloatingWidget {
       moduleLabel: label,
       phaseLabel: 'Inisialisasi',
       percent: 0,
-      totalBytes: 0,
+      capturedCount: 0,
       failedCount: 0,
       etaSeconds: null,
       message: `Memulai ${label} (${endChapter - startChapter + 1} halaman)...`
@@ -708,6 +799,7 @@ export class FloatingWidget {
       payload: {
         bookTitle,
         config: {
+          exportMode: 'native-vector',
           maxRetriesPerChapter,
           chapterNavigationTimeoutMs: navTimeoutSec * 1000
         },
@@ -718,7 +810,7 @@ export class FloatingWidget {
           bookId: structure.bookId,
           bookTitle,
           bookAuthor,
-          savePerPageDebug: !!savePerPageChk?.checked,
+          exportMode: 'native-vector',
           chapterTitles,
           tocItems: filteredTocItems
         }
@@ -726,7 +818,10 @@ export class FloatingWidget {
     };
 
     try {
-      const response = await chrome.runtime.sendMessage(message);
+      const response = (await getBrowserApi().runtime.sendMessage(message)) as {
+        success?: boolean;
+        error?: string;
+      };
       logger.info('Start export response:', response);
 
       if (response?.success) {
@@ -747,7 +842,7 @@ export class FloatingWidget {
     } catch (err) {
       logger.error('Failed to send START_EXPORT message:', err);
       this.finishExportSession();
-      this.updateStatus('error', 'Gagal berkomunikasi dengan background service worker.');
+      this.updateStatus('error', 'Gagal berkomunikasi dengan background script ekstensi.');
     }
   }
 
@@ -760,7 +855,7 @@ export class FloatingWidget {
     };
 
     try {
-      await chrome.runtime.sendMessage(message);
+      await getBrowserApi().runtime.sendMessage(message);
     } catch (err) {
       logger.error('Failed to send STOP_EXPORT message:', err);
       this.finishExportSession();
@@ -784,9 +879,6 @@ export class FloatingWidget {
     void this.handleStart();
   }
 
-  /**
-   * Called by content/index.ts when Background pushes real-time EXPORT_PROGRESS
-   */
   handleExportProgressNotification(progress: ExportProgress): void {
     this.renderProgressCard(progress);
 
@@ -797,44 +889,40 @@ export class FloatingWidget {
     }
   }
 
-  /**
-   * Called by content/index.ts when Background pushes EXPORT_COMPLETE
-   */
   handleExportCompleteNotification(payload: ExportCompleteMessage['payload']): void {
     this.finishExportSession();
 
     const summary: BatchExportSummary | undefined = payload.summary;
     const filename = summary?.outputFilename || payload.filename;
-    const outputBytes = summary?.outputBytes ?? payload.outputBytes ?? summary?.totalBytes ?? 0;
-    const sizeMb = (outputBytes / 1024 / 1024).toFixed(2);
     const pdfPages =
       summary?.totalPdfPages ?? payload.totalPdfPages ?? summary?.capturedCount ?? payload.totalChapters;
-    const bookmarks = summary?.bookmarkCount ?? payload.bookmarkCount ?? 0;
     const failedCount = summary?.failedCount ?? 0;
     const totalReq = summary?.totalRequested ?? pdfPages;
 
-    if (summary?.status === 'STOPPED') {
-      const pct = totalReq > 0 ? Math.round((summary.capturedCount / totalReq) * 100) : 0;
-      const msg = summary.outputFilename
-        ? `⏹ Dihentikan. PDF parsial diunduh: ${filename} (${pdfPages} hal, ${sizeMb} MB, ${bookmarks} bookmarks).`
-        : `⏹ Dihentikan. ${summary.capturedCount}/${totalReq} hal selesai.`;
+    if (summary?.status === 'STOPPED' || payload.vectorSaveStatus === 'canceled') {
+      const pct = totalReq > 0 ? Math.round(((summary?.capturedCount ?? 0) / totalReq) * 100) : 0;
+      const msg =
+        payload.vectorSaveStatus === 'canceled'
+          ? `⏹ Dialog simpan PDF vektor dibatalkan (${pdfPages} hal sempat dikumpulkan).`
+          : summary?.outputFilename
+            ? `⏹ Dihentikan. PDF vektor parsial disimpan: ${filename} (${pdfPages} hal).`
+            : `⏹ Dihentikan. ${summary?.capturedCount ?? 0}/${totalReq} hal selesai.`;
 
       this.renderProgressCard({
         status: 'STOPPED',
-        currentChapter: summary.capturedCount,
+        currentChapter: summary?.capturedCount ?? pdfPages,
         totalChaptersEstimated: totalReq,
         chapterTitle: filename,
-        moduleLabel: summary.label,
-        phaseLabel: 'Parsial',
+        moduleLabel: summary?.label,
+        phaseLabel: payload.vectorSaveStatus === 'canceled' ? 'Dibatalkan' : 'Parsial',
         percent: pct,
-        capturedCount: summary.capturedCount,
+        capturedCount: summary?.capturedCount ?? pdfPages,
         failedCount,
-        totalBytes: outputBytes,
         etaSeconds: null,
         message: msg
       });
 
-      if (summary.resumeFromChapter !== null && summary.resumeFromChapter !== undefined) {
+      if (summary?.resumeFromChapter !== null && summary?.resumeFromChapter !== undefined) {
         this.showResumeBanner(
           summary.resumeFromChapter,
           `Ekspor berhenti di ch/${summary.lastChapterIndex ?? summary.startChapter}. Anda bisa melanjutkan sisa halaman:`
@@ -848,6 +936,11 @@ export class FloatingWidget {
         ? ` • ⚠ ${failedCount} hal dilewati (${summary.failedChapters.map((f) => `ch/${f.chapterIndex}`).join(', ')})`
         : '';
 
+    const completeMsg =
+      payload.vectorSaveStatus === 'fallback-print'
+        ? `✅ Dialog cetak dibuka (${pdfPages} hal) — pilih "Save to PDF"${skipInfo}`
+        : `✅ Selesai! PDF Vektor disimpan: ${filename} (${pdfPages} hal)${skipInfo}`;
+
     this.renderProgressCard({
       status: 'COMPLETED',
       currentChapter: summary?.capturedCount ?? pdfPages,
@@ -858,15 +951,11 @@ export class FloatingWidget {
       percent: 100,
       capturedCount: summary?.capturedCount ?? pdfPages,
       failedCount,
-      totalBytes: outputBytes,
       etaSeconds: 0,
-      message: `✅ Selesai! ${filename} (${pdfPages} hal, ${sizeMb} MB, ${bookmarks} bookmarks)${skipInfo}`
+      message: completeMsg
     });
   }
 
-  /**
-   * Called by content/index.ts when Background pushes EXPORT_ERROR
-   */
   handleExportErrorNotification(payload: ExportErrorMessage['payload']): void {
     this.finishExportSession();
 
@@ -886,7 +975,6 @@ export class FloatingWidget {
       percent: pct,
       capturedCount: captured,
       failedCount: summary?.failedCount ?? 0,
-      totalBytes: summary?.outputBytes ?? summary?.totalBytes ?? 0,
       etaSeconds: null,
       message: `❌ ${payload.message}${suffix}`
     });
@@ -917,9 +1005,7 @@ export class FloatingWidget {
 
     const pct = Math.max(0, Math.min(100, Math.round(progress.percent ?? 0)));
 
-    if (card) {
-      card.classList.add('visible');
-    }
+    card?.classList.add('visible');
 
     if (pctEl) pctEl.textContent = `${pct}%`;
     if (headerPct) headerPct.textContent = `${pct}%`;
@@ -971,8 +1057,8 @@ export class FloatingWidget {
     }
 
     if (leftEl) {
-      const mb = ((progress.totalBytes ?? 0) / 1024 / 1024).toFixed(2);
-      leftEl.textContent = `${mb} MB`;
+      const captured = progress.capturedCount ?? progress.currentChapter ?? 0;
+      leftEl.textContent = `${captured} hal terkumpul`;
     }
 
     if (skipPill) {
@@ -989,7 +1075,7 @@ export class FloatingWidget {
       if (progress.status === 'COMPLETED') {
         rightEl.textContent = 'Selesai';
       } else if (progress.status === 'STITCHING') {
-        rightEl.textContent = 'Menyusun PDF...';
+        rightEl.textContent = 'Menyiapkan Save As...';
       } else if (typeof progress.etaSeconds === 'number' && progress.etaSeconds > 0) {
         rightEl.textContent = `Sisa ~${this.formatDuration(progress.etaSeconds)}`;
       } else if (isBusy) {
@@ -1021,15 +1107,14 @@ export class FloatingWidget {
     banner?.classList.remove('visible');
   }
 
-  /**
-   * Lightweight 2s fallback safety poll in case a push notification is dropped during tab transitions
-   */
   private startProgressPolling(): void {
     if (this.pollIntervalId) return;
 
     this.pollIntervalId = window.setInterval(async () => {
       try {
-        const res = (await chrome.runtime.sendMessage({ type: 'GET_STATUS' })) as StatusResponseMessage;
+        const res = (await getBrowserApi().runtime.sendMessage({
+          type: 'GET_STATUS'
+        })) as StatusResponseMessage;
         if (res?.type === 'STATUS_RESPONSE' && res.payload) {
           this.handleExportProgressNotification(res.payload);
         }
@@ -1049,7 +1134,7 @@ export class FloatingWidget {
   private openKeepAlivePort(): void {
     if (this.keepAlivePort) return;
     try {
-      this.keepAlivePort = chrome.runtime.connect({ name: 'rbv-export-keepalive' });
+      this.keepAlivePort = getBrowserApi().runtime.connect({ name: 'rbv-export-keepalive' });
       this.keepAlivePort.onDisconnect.addListener(() => {
         this.keepAlivePort = null;
       });
@@ -1102,7 +1187,6 @@ export class FloatingWidget {
     const moduleSelect = this.shadowRoot.querySelector('#rbv-module-select') as HTMLSelectElement | null;
     const startInput = this.shadowRoot.querySelector('#rbv-start-ch') as HTMLInputElement | null;
     const endInput = this.shadowRoot.querySelector('#rbv-end-ch') as HTMLInputElement | null;
-    const saveChk = this.shadowRoot.querySelector('#rbv-chk-save-per-page') as HTMLInputElement | null;
     const retriesInput = this.shadowRoot.querySelector('#rbv-adv-retries') as HTMLInputElement | null;
     const timeoutInput = this.shadowRoot.querySelector('#rbv-adv-timeout') as HTMLInputElement | null;
 
@@ -1112,7 +1196,6 @@ export class FloatingWidget {
     if (moduleSelect) moduleSelect.disabled = exporting;
     if (startInput) startInput.disabled = exporting;
     if (endInput) endInput.disabled = exporting;
-    if (saveChk) saveChk.disabled = exporting;
     if (retriesInput) retriesInput.disabled = exporting;
     if (timeoutInput) timeoutInput.disabled = exporting;
 
@@ -1127,13 +1210,13 @@ export class FloatingWidget {
       case 'NAVIGATING':
         return 'Navigasi';
       case 'CAPTURING_PAGE':
-        return 'Cetak PDF';
+        return 'Snapshot DOM';
       case 'RETRYING':
         return 'Mengulang';
       case 'WAITING_NEXT':
         return 'Berikutnya';
       case 'STITCHING':
-        return 'Menggabungkan';
+        return 'Simpan Vektor';
       case 'COMPLETED':
         return 'Selesai';
       case 'STOPPED':
@@ -1157,14 +1240,5 @@ export class FloatingWidget {
     const parsed = typeof raw === 'number' ? raw : parseInt(String(raw ?? ''), 10);
     if (Number.isNaN(parsed)) return fallback;
     return Math.max(min, Math.min(max, Math.floor(parsed)));
-  }
-
-  private escapeHtml(str: string): string {
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
   }
 }

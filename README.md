@@ -1,158 +1,66 @@
-# RBV-UT to PDF Exporter (Edge & Chrome Extension)
+# RBV-UT to PDF Exporter (Mozilla Firefox Add-on)
 
-A standalone **Manifest V3** browser extension for Microsoft Edge and Google Chrome that exports digital textbooks (*Buku Materi Pokok / BMP*) from the Universitas Terbuka (UT) Kotobee Reader (`https://univterbuka.kotobee.com/`) into a single **clean, searchable PDF per module or full book**—preserving selectable text, equations, tables, diagrams, and **hierarchical Bookmarks (Table of Contents)** optimized for **NotebookLM**.
+A lightweight, standalone **Manifest V3** browser add-on for **Mozilla Firefox (140+)** that exports digital textbooks (*Buku Materi Pokok / BMP*) from the Universitas Terbuka (UT) Kotobee Reader (`https://univterbuka.kotobee.com/`) into a single **clean, crisp, searchable vector PDF per module or custom range**—preserving selectable text, equations, tables, and diagrams optimized for **NotebookLM**.
 
 ---
 
-## ✨ Key Features (v1.0.0)
+## ✨ Key Features (Firefox MV3 — v1.0.0)
 
-- **Isolated Print Stage (Zero Live DOM Disruption):** Extracts active chapter content into an isolated `@media print` stage, completely removing Kotobee sidebars, headers, zoom buttons, and hatched backgrounds without disturbing the live Ionic 1 reader layout.
-- **Module & Custom Range Auto-Navigator:** Automatically parses the Kotobee Table of Contents (TOC) to group chapters by Module, supporting per-module, custom range, or full-book exports—with automatic Single-Page view switching and restoration.
-- **Incremental PDF Assembler & Bookmarks (`pdf-lib`):** Stitches captured chapter buffers incrementally into one structured PDF with hierarchical Document Outlines, downloaded reliably via an MV3 Offscreen Blob URL worker (supports large multi-megabyte files).
-- **Interactive Progress Card & 1-Click Resume:** Displays real-time progress percentage, `"Halaman X dari Y (Modul Z)"` status, phase badge, live MB size, rolling ETA, minimized mini-progress bar, **Stop & Save Partial**, and 1-click **Resume from last chapter**.
-- **Error Resilience & Circuit Breaker:** Protected by a bounded CDP `Page.printToPDF` timeout guard, exponential-backoff retries, offline recovery wait, UT SSO session-expiry detection, single-chapter skip-and-continue, and a 3-consecutive-failure circuit breaker with automatic partial PDF rescue.
-- **Edge Add-ons Ready Packaging:** Zero-dependency POSIX-safe ZIP builder and pre-flight store compliance validator (`npm run package`).
+- **Native Vector PDF Engine (`browser.tabs.saveAsPDF`):** Navigates automatically across all chapters in the selected module/range, clones each page with uniquely scoped CSS and inlined `blob:` images into a single consolidated `@media print` stage, and invokes Firefox's native Gecko vector PDF engine (`browser.tabs.saveAsPDF()`) once at the end—producing sharp, compact, 100% searchable PDFs with zero Kotobee UI clutter.
+- **Zero-`innerHTML` AMO-Safe Architecture:** Clones chapter nodes via `cloneNode(true)` / `document.importNode()` and constructs the Shadow DOM floating widget exclusively via safe DOM APIs—passing Mozilla's official `addons-linter` with **0 errors, 0 warnings, and 0 notices**.
+- **Minimal Permissions:** Only requests `storage`, `activeTab`, `scripting`, and `https://univterbuka.kotobee.com/*` with `"data_collection_permissions": { "required": ["none"] }`.
+- **Module & Custom Range Auto-Navigator:** Automatically scans Kotobee's Table of Contents (TOC) to group chapters by Module, with automatic Single-Page view switching and restoration.
+- **Interactive Progress Card, Resilience & 1-Click Resume:** Real-time progress bar, percentage, collected page telemetry, rolling ETA, exponential-backoff retries, offline recovery wait, UT SSO expiry detection, single-chapter skip, a 3-consecutive-failure circuit breaker, **Stop & Save Partial**, and 1-click **Resume**.
+- **AMO-Ready Packaging & Source Archiver:** Generates both the add-on `.zip` and the reviewer-required clean `-source.zip` with built-in AMO manifest compliance checks (`npm run package`).
 
 ---
 
 ## 🛠️ Tech Stack & Prerequisites
 
-- **Runtime:** Node.js (v18+ recommended, verified on Node v24) & npm
-- **Architecture:** Chrome Manifest V3 (Chromium / Edge 116+)
-- **Language:** TypeScript (`strict: true`)
-- **Bundler:** Vite 6 (Multi-target ESM & IIFE pipeline)
-- **Silent PDF Engine:** Chrome DevTools Protocol (CDP) via `chrome.debugger` (`Page.printToPDF`)
-- **PDF Assembly:** `pdf-lib`
-- **UI:** Shadow DOM floating widget with `chrome.storage.local` preference persistence
+- **Runtime:** Node.js v22+ (tested on Node v24) & npm
+- **Target Browser:** Mozilla Firefox Desktop **140.0+** (Manifest V3 Event Page)
+- **Language:** TypeScript (`strict: true`, `@types/firefox-webext-browser`)
+- **Bundler:** Vite 6 (ESM Background Event Page + IIFE Content Script)
+- **PDF Engine:** Firefox Native Vector (`browser.tabs.saveAsPDF()` + `window.print()` fallback)
+- **AMO Linter:** Official Mozilla `addons-linter` v10+
 
 ---
 
-## 🚀 Build & Release Packaging
+## 🚀 Build, Lint, Test & Release Packaging
 
-### 1. Install Dependencies
 ```bash
 npm install
-```
-
-### 2. Build the Extension
-```bash
 npm run build
-```
-
-Watch mode during development:
-```bash
-npm run dev
-```
-
-Static type check:
-```bash
-npm run type-check
-```
-
-### 3. Build Release ZIP for Microsoft Edge Add-ons
-```bash
+npm run lint:amo
+npm run test:resilience
 npm run package
 ```
 
-`npm run package` runs `npm run build`, executes pre-flight store compliance checks (manifest schema, version sync, binary PNG icon dimensions, forbidden dev files), and generates a POSIX-safe ZIP archive at:
-```text
-releases/rbv-ut-to-pdf-exporter-v1.0.0-edge.zip
-```
-
-See [docs/edge-addons-submission.md](docs/edge-addons-submission.md) for the Partner Center submission guide and [POLICY.md](POLICY.md) for the public Privacy Policy.
+`npm run package` runs `npm run build`, `npm run lint:amo`, and pre-flight AMO manifest/icon checks, producing two POSIX-safe archives in `releases/`:
+- `releases/rbv-ut-to-pdf-exporter-v1.0.0-firefox.zip` *(Add-on package for AMO)*
+- `releases/rbv-ut-to-pdf-exporter-v1.0.0-firefox-source.zip` *(Clean Source Code archive for AMO reviewers)*
 
 ---
 
-## 📥 Local Installation (Load Unpacked)
+## 📥 Local Installation in Firefox (Temporary Add-on)
 
-### Microsoft Edge
-1. Open `edge://extensions`.
-2. Enable **Developer mode** in the left sidebar.
-3. Click **Load unpacked** and select the `dist/` directory.
-4. **RBV-UT to PDF Exporter v1.0.0** will appear active with `Errors: 0`.
-
-### Google Chrome
-1. Open `chrome://extensions`.
-2. Enable **Developer mode** in the top-right corner.
-3. Click **Load unpacked** and select the `dist/` directory.
+1. Run `npm run build`.
+2. Open `about:debugging#/runtime/this-firefox` in Mozilla Firefox.
+3. Click **Load Temporary Add-on...** and select `dist/manifest.json`.
+4. Open a textbook at [https://univterbuka.kotobee.com/](https://univterbuka.kotobee.com/) (signed in with your UT SSO account).
+5. If the floating widget is not visible yet, click the **RBV-UT to PDF Exporter** toolbar icon and click **Allow** when Firefox asks for host access on `https://univterbuka.kotobee.com/*`.
 
 ---
 
 ## 📖 Usage on UT Kotobee Reader
 
-1. Sign in to [https://univterbuka.kotobee.com/](https://univterbuka.kotobee.com/) with your Universitas Terbuka SSO account.
-2. Open any digital BMP textbook. The floating **RBV-UT Exporter** widget mounts automatically in the top-right corner (click the extension toolbar icon anytime to minimize or expand it).
-3. Choose a **Module** from the dropdown menu or specify a custom `Dari Ch` – `Sampai Ch` chapter range.
-4. Click **🚀 Ekspor ke 1 File PDF** to export the entire range into one bookmarked PDF, or **📄 Cetak Halaman Aktif** to export only the current page.
-5. Track live progress, MB captured, and ETA in the progress card. Click **⏹ Berhenti & Simpan Parsial** anytime to stop gracefully, save all captured pages so far, and resume later via the 1-click **▶ Lanjutkan dari Ch X** button.
-6. Expand **⚙ Alat Lanjutan & Diagnostik** to configure max retries, per-page timeout, per-page debug output, or copy DOM/TOC diagnostics.
-
----
-
-## 📂 Project Structure
-
-```text
-ut-digital-book-scrapper/
-├── POLICY.md                         # Public Privacy Policy for Microsoft Edge Add-ons
-├── README.md                         # Project documentation
-├── public/
-│   ├── manifest.json                 # Manifest V3 declaration (v1.0.0)
-│   ├── offscreen.html                # MV3 Offscreen document for large Blob downloads
-│   └── icons/                        # Validated PNG icons (16, 32, 48, 128px)
-├── src/
-│   ├── background/                   # Service Worker (ES Module)
-│   │   ├── index.ts                  # Entry SW, toolbar toggle & keep-alive port
-│   │   ├── debugger-manager.ts       # chrome.debugger lifecycle & friendly error mapper
-│   │   ├── cdp-printer.ts            # CDP Page.printToPDF with timeout & %PDF guard
-│   │   ├── export-orchestrator.ts    # Batch engine, retry backoff & circuit breaker
-│   │   ├── pdf-assembler.ts          # Incremental pdf-lib document merger
-│   │   ├── pdf-outlines.ts           # Hierarchical PDF Bookmark / Outline builder
-│   │   ├── pdf-downloader.ts         # Offscreen Blob / chunked fallback downloader
-│   │   └── message-router.ts         # Typed message router & real-time progress push
-│   ├── content/                      # Content Script (IIFE, top-frame idempotent)
-│   │   ├── index.ts                  # Entry content script & page health checks
-│   │   ├── dom-detector.ts           # Kotobee reader & metadata detection
-│   │   ├── toc-parser.ts             # TOC extractor & Module range grouper
-│   │   ├── page-navigator.ts         # Auto-navigator & DOM quiescence observer
-│   │   ├── print-styler.ts           # Isolated Print Stage (FXL & Reflowable)
-│   │   └── ui-injector.ts            # Shadow DOM host mount & viewport clamping
-│   ├── offscreen/
-│   │   └── index.ts                  # Blob URL assembly worker for large PDFs
-│   ├── ui/
-│   │   ├── widget.ts                 # Floating widget state, progress card & resume flow
-│   │   └── widget.css                # Scoped Shadow DOM styles
-│   ├── types/
-│   │   ├── cdp.ts
-│   │   ├── exporter.ts
-│   │   ├── messages.ts
-│   │   └── vite-env.d.ts
-│   └── utils/
-│       ├── logger.ts
-│       ├── sanitize.ts
-│       └── storage.ts                # chrome.storage.local preference wrapper
-├── scripts/
-│   ├── build.js                      # Multi-target Vite production build
-│   ├── package.js                    # Pre-flight store validator & POSIX ZIP packager
-│   ├── generate-icons.js
-│   └── test-fase5-resilience.ts      # Automated resilience & circuit breaker tests
-├── docs/
-│   ├── blueprint_aplikasi_rbv_ut_to_pdf_exporter.md
-│   └── edge-addons-submission.md     # Microsoft Edge Partner Center submission guide
-└── package.json
-```
+1. Sign in to [https://univterbuka.kotobee.com/](https://univterbuka.kotobee.com/) and open any BMP textbook.
+2. Select a **Module** from the dropdown (or enter a manual `Dari Ch` – `Sampai Ch` range).
+3. Click **🚀 Ekspor ke 1 File PDF** to collect all chapters in the range and open Firefox's **Save As PDF** dialog once at the end (or **📄 Cetak Halaman Aktif** for only the active page).
+4. Click **⏹ Berhenti & Simpan Parsial** anytime to stop gracefully and save already-collected chapters, then resume with **▶ Lanjutkan dari Ch X**.
 
 ---
 
 ## 🔒 Privacy Policy
 
-This extension processes all pages **100% locally** inside your browser and never collects or transmits personal data, credentials, or book contents. Read the full policy in [POLICY.md](POLICY.md).
-
----
-
-## 🗺️ Development Roadmap
-
-- [x] **Phase 1: Project Scaffolding & Manifest V3 Baseline** *(Completed)*
-- [x] **Phase 2: CDP Silent Print & Single Chapter Clean Exporter** *(Completed)*
-- [x] **Phase 3: Module & Page Range Auto-Navigator** *(Completed)*
-- [x] **Phase 4: PDF Assembler (`pdf-lib`), Bookmarks & Module Stitching** *(Completed)*
-- [x] **Phase 5: UI/UX Progress Bar, Error Resilience & Edge Add-ons Packaging** *(Completed — v1.0.0)*
+This add-on processes all pages **100% locally** inside Firefox, declares `"data_collection_permissions": { "required": ["none"] }`, and never collects or transmits any personal data, credentials, or book contents. Read the full policy in [POLICY.md](POLICY.md).

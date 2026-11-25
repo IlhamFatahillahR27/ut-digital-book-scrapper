@@ -1,7 +1,7 @@
-import { DebuggerManager } from './debugger-manager';
-import { CdpPrinter } from './cdp-printer';
+import { TabSessionManager } from './tab-session-manager';
+import { FirefoxPdfPrinter } from './firefox-pdf-printer';
+import { getBrowserApi } from '../utils/browser-api';
 import { logger } from '../utils/logger';
-import { sanitizeFilename } from '../utils/sanitize';
 import {
   DEFAULT_EXPORTER_CONFIG,
   type BatchExportSummary,
@@ -12,27 +12,18 @@ import {
   type FailedChapterMeta
 } from '../types/exporter';
 import type {
+  CaptureVectorSnapshotResponse,
   CheckPageHealthResponse,
   EnsureSinglePageModeResponse,
-  NavigateToChapterResponse,
-  PrepareForPrintResponse
+  NavigateToChapterResponse
 } from '../types/messages';
-
-export type ChapterCapturedHook = (
-  buffer: Uint8Array,
-  meta: CapturedChapterMeta,
-  base64: string
-) => Promise<void> | void;
 
 export interface OrchestratorCallbacks {
   onProgress: (progress: ExportProgress) => void;
-  savePdfFile: (tabId: number, base64: string, filename: string) => Promise<void>;
-  /** Pluggable hook for Phase 4 PdfAssembler to collect chapter buffers */
-  onChapterCaptured?: ChapterCapturedHook;
   /**
    * When true and >= 1 chapter is captured, keeps progress in 'STITCHING' instead of
-   * emitting terminal COMPLETED/STOPPED/ERROR so caller can finish PDF assembly & download
-   * before unlocking the UI.
+   * emitting terminal COMPLETED/STOPPED/ERROR so caller can mount the consolidated
+   * vector print stage & run browser.tabs.saveAsPDF() before unlocking the UI.
    */
   deferTerminalStatus?: boolean;
 }
@@ -50,18 +41,22 @@ class StageError extends Error {
 }
 
 export class ExportOrchestrator {
-  private debuggerManager: DebuggerManager;
-  private cdpPrinter: CdpPrinter;
+  private sessionManager: TabSessionManager;
+  private pdfPrinter: FirefoxPdfPrinter;
 
   private activeTabId: number | null = null;
   private activeAbortController: AbortController | null = null;
   private running = false;
-  private isPrintingNow = false;
+  private isCapturingNow = false;
   private stopRequested = false;
 
-  constructor(debuggerManager: DebuggerManager, cdpPrinter: CdpPrinter) {
-    this.debuggerManager = debuggerManager;
-    this.cdpPrinter = cdpPrinter;
+  constructor(sessionManager: TabSessionManager, pdfPrinter: FirefoxPdfPrinter) {
+    this.sessionManager = sessionManager;
+    this.pdfPrinter = pdfPrinter;
+  }
+
+  getPdfPrinter(): FirefoxPdfPrinter {
+    return this.pdfPrinter;
   }
 
   isRunning(): boolean {
@@ -70,12 +65,11 @@ export class ExportOrchestrator {
 
   /**
    * Triggers Graceful Stop on an active export batch.
-   * Immediately aborts any ongoing navigation/wait; if CDP Page.printToPDF is in-flight,
-   * stops right after the active page completes and guarantees full cleanup.
+   * Immediately aborts any ongoing navigation/wait and rescues already-captured snapshots.
    */
   async stop(reason = 'User manual stop', onProgress?: (progress: ExportProgress) => void): Promise<void> {
     if (!this.running) {
-      await this.debuggerManager.detach().catch(() => {});
+      this.sessionManager.endSession();
       return;
     }
 
@@ -88,21 +82,19 @@ export class ExportOrchestrator {
 
     if (onProgress) {
       onProgress({
-        // Keep a busy status until the finally block completes cleanup & debugger detach
-        status: this.isPrintingNow ? 'CAPTURING_PAGE' : 'WAITING_NEXT',
+        status: this.isCapturingNow ? 'CAPTURING_PAGE' : 'WAITING_NEXT',
         currentChapter: 0,
         chapterTitle: 'Menghentikan...',
         phaseLabel: 'Menghentikan',
-        message: this.isPrintingNow
-          ? 'Menghentikan setelah halaman aktif selesai dicetak...'
-          : 'Menghentikan navigasi & membersihkan sesi...'
+        message: this.isCapturingNow
+          ? 'Menghentikan setelah halaman aktif selesai direkam...'
+          : 'Menghentikan navigasi & menyelamatkan halaman terkumpul...'
       });
     }
 
-    // Immediately abort any waiting navigation loop in content script (<100ms)
     if (this.activeTabId !== null) {
       try {
-        await chrome.tabs.sendMessage(this.activeTabId, { type: 'ABORT_NAVIGATION' });
+        await getBrowserApi().tabs.sendMessage(this.activeTabId, { type: 'ABORT_NAVIGATION' });
       } catch {
         // Tab may already be closing or busy
       }
@@ -110,9 +102,9 @@ export class ExportOrchestrator {
   }
 
   /**
-   * Executes a multi-chapter sequential export over [range.startChapter .. range.endChapter]
-   * with exponential-backoff retry, CDP timeout guards, offline/SSO health checks,
-   * single-chapter skip, and a 3-consecutive-failure circuit breaker.
+   * Executes a multi-chapter sequential vector snapshot collection over [startChapter .. endChapter]
+   * with exponential-backoff retry, offline/SSO health checks, single-chapter skip,
+   * and a 3-consecutive-failure circuit breaker.
    */
   async runBatchExport(
     tabId: number,
@@ -128,13 +120,13 @@ export class ExportOrchestrator {
     const endChapter = Math.max(startChapter, Math.floor(range.endChapter));
     const totalRequested = endChapter - startChapter + 1;
     const config: ExporterConfig = { ...DEFAULT_EXPORTER_CONFIG, ...partialConfig };
-    const bookTitle = range.bookTitle || 'BMP_UT';
     const label = range.label || `Ch ${startChapter}-${endChapter}`;
     const startedAt = Date.now();
+    const api = getBrowserApi();
 
     this.running = true;
     this.stopRequested = false;
-    this.isPrintingNow = false;
+    this.isCapturingNow = false;
     this.activeTabId = tabId;
     this.activeAbortController = new AbortController();
     const { signal } = this.activeAbortController;
@@ -153,10 +145,13 @@ export class ExportOrchestrator {
     let finalStatus: BatchExportSummary['status'] = 'COMPLETED';
     let finalErrorMessage: string | undefined;
 
-    // MV3 Service Worker lightweight keep-alive heartbeat during long batches
     const keepAliveTimer = setInterval(() => {
-      if (typeof chrome !== 'undefined' && chrome.runtime?.getPlatformInfo) {
-        chrome.runtime.getPlatformInfo(() => {});
+      try {
+        if (api.runtime?.getPlatformInfo) {
+          void api.runtime.getPlatformInfo();
+        }
+      } catch {
+        // Ignore heartbeat error
       }
     }, 20000);
 
@@ -167,7 +162,9 @@ export class ExportOrchestrator {
       return Math.max(1, Math.round((avgMs * remainingPages) / 1000));
     };
 
-    const emitProgress = (partial: Omit<ExportProgress, 'moduleLabel' | 'startChapter' | 'endChapter' | 'startedAt'>) => {
+    const emitProgress = (
+      partial: Omit<ExportProgress, 'moduleLabel' | 'startChapter' | 'endChapter' | 'startedAt'>
+    ) => {
       callbacks.onProgress({
         moduleLabel: label,
         startChapter,
@@ -181,17 +178,15 @@ export class ExportOrchestrator {
       });
     };
 
-    // Abort batch immediately if debugger detaches unexpectedly (user closed tab / clicked Cancel on infobar)
-    const unsubscribeDetach = this.debuggerManager.onUnexpectedDetach((detachedTabId, reason) => {
-      if (detachedTabId === tabId && this.running && !this.stopRequested) {
-        logger.warn(`ExportOrchestrator: Unexpected debugger detach (${reason}). Aborting batch.`);
-        finalErrorMessage = DebuggerManager.formatFriendlyError(reason);
+    const unsubscribeEnd = this.sessionManager.onUnexpectedEnd((endedTabId, reason) => {
+      if (endedTabId === tabId && this.running && !this.stopRequested) {
+        logger.warn(`ExportOrchestrator: Unexpected tab session end (${reason}). Aborting batch.`);
+        finalErrorMessage = TabSessionManager.formatFriendlyError(reason);
         this.activeAbortController?.abort();
       }
     });
 
     try {
-      // 1. Attach debugger ONCE for the entire batch session
       emitProgress({
         status: 'INITIALIZING',
         currentChapter: 0,
@@ -199,13 +194,13 @@ export class ExportOrchestrator {
         totalChaptersEstimated: totalRequested,
         chapterTitle: label,
         phaseLabel: 'Inisialisasi',
-        message: `Menghubungkan browser untuk ${label} (${totalRequested} halaman)...`,
+        message: `Menyiapkan sesi Vektor Native untuk ${label} (${totalRequested} halaman)...`,
         percent: 0,
         etaSeconds: null
       });
 
-      await this.debuggerManager.attach(tabId);
-      await this.cdpPrinter.prepare();
+      await this.sessionManager.startSession(tabId);
+      await api.tabs.sendMessage(tabId, { type: 'CLEAR_VECTOR_SNAPSHOTS' }).catch(() => {});
 
       if (signal.aborted) {
         finalStatus = this.stopRequested ? 'STOPPED' : 'ERROR';
@@ -226,9 +221,9 @@ export class ExportOrchestrator {
         });
       }
 
-      // 2. Ensure Kotobee is in Single-Page mode (avoids Two-Page Spread skipping/duplication)
+      // Ensure Kotobee is in Single-Page mode
       try {
-        const viewRes = (await chrome.tabs.sendMessage(tabId, {
+        const viewRes = (await api.tabs.sendMessage(tabId, {
           type: 'ENSURE_SINGLE_PAGE_MODE'
         })) as EnsureSinglePageModeResponse;
         if (viewRes?.changed) {
@@ -239,14 +234,14 @@ export class ExportOrchestrator {
         logger.warn('ExportOrchestrator: ENSURE_SINGLE_PAGE_MODE failed, continuing:', viewErr);
       }
 
-      // 3. Iterate chapter by chapter across [startChapter .. endChapter]
+      // Iterate chapter by chapter across [startChapter .. endChapter]
       for (let ch = startChapter; ch <= endChapter; ch++) {
         const seq = ch - startChapter + 1;
         const remainingBefore = totalRequested - (seq - 1);
         const pctBefore = Math.round(((seq - 1) / totalRequested) * 100);
         const expectedTitle = range.chapterTitles?.[ch] || `Halaman ${ch + 1}`;
 
-        if (signal.aborted || !this.debuggerManager.isAttached()) {
+        if (signal.aborted || !this.sessionManager.isActive()) {
           finalStatus = this.stopRequested ? 'STOPPED' : 'ERROR';
           break;
         }
@@ -259,14 +254,11 @@ export class ExportOrchestrator {
           expectedTitle,
           label,
           bookId: range.bookId,
-          bookTitle,
-          savePerPageDebug: !!range.savePerPageDebug,
           previousFingerprint,
           config,
           signal,
           etaSeconds: computeEta(remainingBefore),
           pctBefore,
-          callbacks,
           emitProgress
         });
 
@@ -305,11 +297,11 @@ export class ExportOrchestrator {
             currentChapterIndex: ch,
             totalChaptersEstimated: totalRequested,
             chapterTitle: attemptResult.meta.title,
-            phaseLabel: seq < totalRequested ? 'Berikutnya' : 'Menggabungkan',
+            phaseLabel: seq < totalRequested ? 'Berikutnya' : 'Simpan Vektor',
             message:
               seq < totalRequested
-                ? `Halaman ${seq} dari ${totalRequested} (${label}) selesai.`
-                : `Semua halaman selesai (${capturedChapters.length}/${totalRequested}). Menyatukan PDF...`,
+                ? `Halaman ${seq} dari ${totalRequested} (${label}) terkumpul.`
+                : `Semua halaman terkumpul (${capturedChapters.length}/${totalRequested}). Membuka dialog Save As PDF...`,
             percent: pctAfter,
             etaSeconds: computeEta(remainingAfter)
           });
@@ -321,7 +313,6 @@ export class ExportOrchestrator {
           continue;
         }
 
-        // Chapter failed after retries (or fatal non-retryable error like SSO session expired)
         if (attemptResult.fatalError) {
           failedCount++;
           failedChapters.push({
@@ -365,7 +356,6 @@ export class ExportOrchestrator {
           break;
         }
 
-        // Skip chapter & continue to the next page
         const pctAfterSkip = Math.round((seq / totalRequested) * 100);
         emitProgress({
           status: 'WAITING_NEXT',
@@ -380,7 +370,7 @@ export class ExportOrchestrator {
         });
       }
     } catch (err) {
-      const errMsg = DebuggerManager.formatFriendlyError(err);
+      const errMsg = TabSessionManager.formatFriendlyError(err);
       logger.error('ExportOrchestrator: Batch export error:', err);
       if (this.stopRequested) {
         finalStatus = 'STOPPED';
@@ -390,24 +380,21 @@ export class ExportOrchestrator {
       }
     } finally {
       clearInterval(keepAliveTimer);
-      unsubscribeDetach();
+      unsubscribeEnd();
 
-      // Guaranteed cleanup: abort any pending wait, remove print stage, restore view mode, detach debugger
-      await chrome.tabs.sendMessage(tabId, { type: 'ABORT_NAVIGATION' }).catch(() => {});
-      await chrome.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
+      await api.tabs.sendMessage(tabId, { type: 'ABORT_NAVIGATION' }).catch(() => {});
 
       if (changedPageViewMode) {
-        await chrome.tabs.sendMessage(tabId, { type: 'RESTORE_PAGE_VIEW_MODE' }).catch(() => {});
+        await api.tabs.sendMessage(tabId, { type: 'RESTORE_PAGE_VIEW_MODE' }).catch(() => {});
       }
 
-      await this.debuggerManager.detach().catch(() => {});
+      this.sessionManager.endSession();
 
       this.running = false;
-      this.isPrintingNow = false;
+      this.isCapturingNow = false;
       this.activeAbortController = null;
       this.activeTabId = null;
 
-      const totalMb = (totalBytes / 1024 / 1024).toFixed(2);
       if (callbacks.deferTerminalStatus && capturedChapters.length > 0) {
         const isPartial = finalStatus !== 'COMPLETED';
         emitProgress({
@@ -416,10 +403,10 @@ export class ExportOrchestrator {
           currentChapterIndex: lastChapterIndex ?? startChapter,
           totalChaptersEstimated: totalRequested,
           chapterTitle: label,
-          phaseLabel: 'Menggabungkan',
+          phaseLabel: 'Simpan Vektor',
           message: isPartial
-            ? `Menyelamatkan PDF parsial (${capturedChapters.length} halaman) & menyusun bookmarks...`
-            : `Menggabungkan ${capturedChapters.length} halaman & menyusun bookmarks PDF...`,
+            ? `Menyiapkan PDF vektor parsial (${capturedChapters.length} halaman) untuk dialog Save As...`
+            : `Menyiapkan dokumen vektor (${capturedChapters.length} halaman) untuk dialog Save As...`,
           percent: isPartial ? Math.round((capturedChapters.length / totalRequested) * 100) : 99,
           etaSeconds: 0
         });
@@ -431,7 +418,7 @@ export class ExportOrchestrator {
           totalChaptersEstimated: totalRequested,
           chapterTitle: label,
           phaseLabel: 'Selesai',
-          message: `Selesai! ${capturedChapters.length}/${totalRequested} halaman (${totalMb} MB).${
+          message: `Selesai! ${capturedChapters.length}/${totalRequested} halaman terkumpul.${
             failedCount > 0 ? ` (${failedCount} halaman dilewati)` : ''
           }`,
           percent: 100,
@@ -445,7 +432,7 @@ export class ExportOrchestrator {
           totalChaptersEstimated: totalRequested,
           chapterTitle: 'Dihentikan',
           phaseLabel: 'Dihentikan',
-          message: `Dihentikan pengguna. ${capturedChapters.length}/${totalRequested} halaman selesai (${totalMb} MB).`,
+          message: `Dihentikan pengguna. ${capturedChapters.length}/${totalRequested} halaman terkumpul.`,
           percent: Math.round((capturedChapters.length / totalRequested) * 100),
           etaSeconds: null
         });
@@ -481,10 +468,6 @@ export class ExportOrchestrator {
     });
   }
 
-  /**
-   * Executes the full per-chapter capture pipeline (NAVIGATE -> PREPARE -> PRINT -> ASSEMBLE)
-   * with exponential-backoff retry and offline/SSO health checks.
-   */
   private async processChapterWithRetry(params: {
     tabId: number;
     ch: number;
@@ -493,14 +476,11 @@ export class ExportOrchestrator {
     expectedTitle: string;
     label: string;
     bookId?: string | null;
-    bookTitle: string;
-    savePerPageDebug: boolean;
     previousFingerprint?: string;
     config: ExporterConfig;
     signal: AbortSignal;
     etaSeconds: number | null;
     pctBefore: number;
-    callbacks: OrchestratorCallbacks;
     emitProgress: (
       partial: Omit<ExportProgress, 'moduleLabel' | 'startChapter' | 'endChapter' | 'startedAt'>
     ) => void;
@@ -522,24 +502,22 @@ export class ExportOrchestrator {
       expectedTitle,
       label,
       bookId,
-      bookTitle,
-      savePerPageDebug,
       previousFingerprint,
       config,
       signal,
       etaSeconds,
       pctBefore,
-      callbacks,
       emitProgress
     } = params;
 
+    const api = getBrowserApi();
     const maxRetries = Math.max(0, config.maxRetriesPerChapter);
     const maxAttempts = 1 + maxRetries;
     let lastStage: FailedChapterMeta['stage'] = 'NAVIGATE';
     let lastError = 'Terjadi kesalahan saat memproses halaman.';
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (signal.aborted || !this.debuggerManager.isAttached()) {
+      if (signal.aborted || !this.sessionManager.isActive()) {
         return { success: false, aborted: true, attempts: attempt - 1 };
       }
 
@@ -547,7 +525,6 @@ export class ExportOrchestrator {
       let currentStage: FailedChapterMeta['stage'] = 'NAVIGATE';
 
       try {
-        // 3a. Navigate & wait for page stability
         emitProgress({
           status: attempt > 1 ? 'RETRYING' : 'NAVIGATING',
           currentChapter: seq,
@@ -568,7 +545,7 @@ export class ExportOrchestrator {
         let navResult: NavigateToChapterResponse;
         try {
           navResult = await this.withTimeout(
-            chrome.tabs.sendMessage(tabId, {
+            api.tabs.sendMessage(tabId, {
               type: 'NAVIGATE_TO_CHAPTER',
               payload: {
                 targetChapter: ch,
@@ -582,7 +559,7 @@ export class ExportOrchestrator {
             `Timeout komunikasi navigasi pada ch/${ch}.`
           );
         } catch (navErr) {
-          throw new StageError('NAVIGATE', DebuggerManager.formatFriendlyError(navErr));
+          throw new StageError('NAVIGATE', TabSessionManager.formatFriendlyError(navErr));
         }
 
         if (signal.aborted || navResult?.aborted) {
@@ -598,7 +575,6 @@ export class ExportOrchestrator {
             ? navResult.chapterTitle
             : expectedTitle) || `Halaman_${ch + 1}`;
 
-        // 3b. Prepare Isolated Print Stage
         currentStage = 'PREPARE';
         if (signal.aborted) {
           return { success: false, aborted: true, attempts: attempt };
@@ -610,79 +586,39 @@ export class ExportOrchestrator {
           currentChapterIndex: ch,
           totalChaptersEstimated: totalRequested,
           chapterTitle: resolvedTitle,
-          phaseLabel: 'Menyiapkan',
-          message: `Halaman ${seq} dari ${totalRequested} (${label}): Menyiapkan halaman cetak...`,
+          phaseLabel: 'Snapshot DOM',
+          message: `Halaman ${seq} dari ${totalRequested} (${label}): Merekam halaman vektor (${resolvedTitle})...`,
           percent: pctBefore,
           retryAttempt: attempt > 1 ? attempt - 1 : 0,
           maxRetries,
           etaSeconds
         });
 
-        let prepResult: PrepareForPrintResponse;
+        let snapRes: CaptureVectorSnapshotResponse;
+        this.isCapturingNow = true;
         try {
-          prepResult = await this.withTimeout(
-            chrome.tabs.sendMessage(tabId, {
-              type: 'PREPARE_FOR_PRINT'
-            }) as Promise<PrepareForPrintResponse>,
+          snapRes = await this.withTimeout(
+            api.tabs.sendMessage(tabId, {
+              type: 'CAPTURE_VECTOR_SNAPSHOT',
+              payload: {
+                sequenceNumber: seq,
+                chapterIndex: ch
+              }
+            }) as Promise<CaptureVectorSnapshotResponse>,
             config.preparePrintTimeoutMs,
-            `Timeout menyiapkan halaman cetak pada ch/${ch}.`
+            `Timeout merekam snapshot vektor pada ch/${ch}.`
           );
-        } catch (prepErr) {
-          throw new StageError('PREPARE', DebuggerManager.formatFriendlyError(prepErr));
+        } catch (snapErr) {
+          throw new StageError('PREPARE', TabSessionManager.formatFriendlyError(snapErr));
+        } finally {
+          this.isCapturingNow = false;
         }
 
-        if (!prepResult?.success) {
+        if (!snapRes?.success) {
           throw new StageError(
             'PREPARE',
-            prepResult?.error || `Gagal menyiapkan panggung cetak pada ch/${ch}.`
+            snapRes?.error || `Gagal merekam snapshot vektor pada ch/${ch}.`
           );
-        }
-
-        if (signal.aborted) {
-          await chrome.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
-          return { success: false, aborted: true, attempts: attempt };
-        }
-
-        // 3c. Execute silent CDP Page.printToPDF with timeout
-        currentStage = 'PRINT';
-        emitProgress({
-          status: 'CAPTURING_PAGE',
-          currentChapter: seq,
-          currentChapterIndex: ch,
-          totalChaptersEstimated: totalRequested,
-          chapterTitle: resolvedTitle,
-          phaseLabel: 'Cetak PDF',
-          message: `Halaman ${seq} dari ${totalRequested} (${label}): Mencetak PDF (${resolvedTitle})...`,
-          percent: pctBefore,
-          retryAttempt: attempt > 1 ? attempt - 1 : 0,
-          maxRetries,
-          etaSeconds
-        });
-
-        let base64 = '';
-        let buffer: Uint8Array;
-        this.isPrintingNow = true;
-        try {
-          const printResult = await this.cdpPrinter.printCurrentPage(
-            {
-              printBackground: config.printBackground,
-              generateTaggedPDF: true,
-              ...(prepResult.isFixedLayout ? { pageRanges: '1' } : {})
-            },
-            config.cdpPrintTimeoutMs
-          );
-          base64 = printResult.base64;
-          buffer = printResult.buffer;
-        } catch (printErr) {
-          throw new StageError('PRINT', DebuggerManager.formatFriendlyError(printErr));
-        } finally {
-          this.isPrintingNow = false;
-          await chrome.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
-        }
-
-        const validPdfHeader = this.hasValidPdfHeader(buffer);
-        if (!validPdfHeader) {
-          throw new StageError('PRINT', `Hasil cetak ch/${ch} rusak (header %PDF- tidak valid).`);
         }
 
         const durationMs = Date.now() - chapterStartMs;
@@ -690,35 +626,15 @@ export class ExportOrchestrator {
           chapterIndex: ch,
           sequenceNumber: seq,
           title: resolvedTitle,
-          byteLength: buffer.byteLength,
-          isFixedLayout: !!prepResult.isFixedLayout,
+          byteLength: snapRes.estimatedBytes || 0,
+          isFixedLayout: !!snapRes.isFixedLayout,
           durationMs,
-          validPdfHeader
+          validPdfHeader: true
         };
 
-        // 3d. Phase 4 incremental assembly hook (wrapped so corrupt single-page PDF triggers retry)
-        currentStage = 'ASSEMBLE';
-        if (callbacks.onChapterCaptured) {
-          try {
-            await callbacks.onChapterCaptured(buffer, meta, base64);
-          } catch (asmErr) {
-            throw new StageError(
-              'ASSEMBLE',
-              `Gagal menggabungkan ch/${ch}: ${asmErr instanceof Error ? asmErr.message : String(asmErr)}`
-            );
-          }
-        }
-
-        // 3e. Optional Debug Mode: download individual PDF file per page
-        if (savePerPageDebug) {
-          const seqStr = String(seq).padStart(3, '0');
-          const filename = sanitizeFilename(`${seqStr}_ch${ch}_${bookTitle}_${resolvedTitle}`);
-          await callbacks.savePdfFile(tabId, base64, filename);
-        }
-
         logger.info(
-          `ExportOrchestrator: Captured [${seq}/${totalRequested}] ch/${ch} "${resolvedTitle}" ` +
-            `(${(buffer.byteLength / 1024).toFixed(1)} KB, attempt=${attempt}, ${durationMs}ms)`
+          `ExportOrchestrator: Recorded vector snapshot [${seq}/${totalRequested}] ch/${ch} "${resolvedTitle}" ` +
+            `(attempt=${attempt}, ${durationMs}ms)`
         );
 
         return {
@@ -728,18 +644,23 @@ export class ExportOrchestrator {
           attempts: attempt
         };
       } catch (err) {
-        // Ensure clean DOM after any failed attempt
-        await chrome.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
-
         const stageErr = err instanceof StageError ? err : null;
         lastStage = stageErr?.stage ?? currentStage;
-        lastError = err instanceof Error ? err.message : DebuggerManager.formatFriendlyError(err);
+        lastError = err instanceof Error ? err.message : TabSessionManager.formatFriendlyError(err);
 
-        if (signal.aborted || !this.debuggerManager.isAttached()) {
+        if (stageErr?.fatal) {
+          return {
+            success: false,
+            stage: lastStage,
+            attempts: attempt,
+            fatalError: lastError
+          };
+        }
+
+        if (signal.aborted || !this.sessionManager.isActive()) {
           return { success: false, aborted: true, stage: lastStage, attempts: attempt, error: lastError };
         }
 
-        // Diagnose page health (SSO session expired vs offline vs transient glitch)
         const health = await this.checkPageHealth(tabId);
         if (health?.isLoginPage) {
           return {
@@ -775,7 +696,7 @@ export class ExportOrchestrator {
           }
         }
 
-        if (attempt < maxAttempts && !signal.aborted && this.debuggerManager.isAttached()) {
+        if (attempt < maxAttempts && !signal.aborted && this.sessionManager.isActive()) {
           const backoffMs = Math.max(200, config.retryBaseDelayMs) * Math.pow(2, attempt - 1);
           const backoffSec = (backoffMs / 1000).toFixed(1);
           logger.warn(
@@ -816,7 +737,7 @@ export class ExportOrchestrator {
   private async checkPageHealth(tabId: number): Promise<CheckPageHealthResponse | null> {
     try {
       const res = await this.withTimeout(
-        chrome.tabs.sendMessage(tabId, { type: 'CHECK_PAGE_HEALTH' }) as Promise<CheckPageHealthResponse>,
+        getBrowserApi().tabs.sendMessage(tabId, { type: 'CHECK_PAGE_HEALTH' }) as Promise<CheckPageHealthResponse>,
         3000,
         'Health check timeout'
       );
@@ -873,20 +794,6 @@ export class ExportOrchestrator {
     });
   }
 
-  /**
-   * Verifies PDF magic bytes: "%PDF-" (0x25 0x50 0x44 0x46 0x2D)
-   */
-  private hasValidPdfHeader(buffer: Uint8Array): boolean {
-    return (
-      buffer.byteLength > 100 &&
-      buffer[0] === 0x25 &&
-      buffer[1] === 0x50 &&
-      buffer[2] === 0x44 &&
-      buffer[3] === 0x46 &&
-      buffer[4] === 0x2d
-    );
-  }
-
   private buildSummary(params: {
     status: BatchExportSummary['status'];
     label: string;
@@ -913,6 +820,7 @@ export class ExportOrchestrator {
 
     return {
       status: params.status,
+      exportMode: 'native-vector',
       label: params.label,
       startChapter: params.startChapter,
       endChapter: params.endChapter,

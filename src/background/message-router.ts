@@ -1,22 +1,22 @@
 import type {
   ExtensionMessage,
   ExportProgress,
+  ExportRangeRequest,
+  MountVectorPrintStageResponse,
   PrepareForPrintResponse,
-  ExportRangeRequest
+  VectorSaveStatus
 } from '../types/messages';
+import { getBrowserApi, hasBrowserApi } from '../utils/browser-api';
 import { logger } from '../utils/logger';
-import { DebuggerManager } from './debugger-manager';
-import { CdpPrinter } from './cdp-printer';
+import { TabSessionManager } from './tab-session-manager';
+import { FirefoxPdfPrinter } from './firefox-pdf-printer';
 import { ExportOrchestrator } from './export-orchestrator';
-import { PdfAssembler } from './pdf-assembler';
-import { PdfDownloader } from './pdf-downloader';
 import { sanitizeFilename } from '../utils/sanitize';
 
 export class MessageRouter {
-  private debuggerManager: DebuggerManager;
-  private cdpPrinter: CdpPrinter;
+  private sessionManager: TabSessionManager;
+  private pdfPrinter: FirefoxPdfPrinter;
   private orchestrator: ExportOrchestrator;
-  private pdfDownloader: PdfDownloader;
   private isFinalizing = false;
   private activeTabId: number | null = null;
   private currentProgress: ExportProgress = {
@@ -27,586 +27,482 @@ export class MessageRouter {
   };
 
   constructor(
-    debuggerManager: DebuggerManager,
-    cdpPrinter: CdpPrinter,
-    orchestrator?: ExportOrchestrator,
-    pdfDownloader?: PdfDownloader
+    sessionManager: TabSessionManager,
+    pdfPrinter: FirefoxPdfPrinter,
+    orchestrator?: ExportOrchestrator
   ) {
-    this.debuggerManager = debuggerManager;
-    this.cdpPrinter = cdpPrinter;
-    this.orchestrator = orchestrator ?? new ExportOrchestrator(debuggerManager, cdpPrinter);
-    this.pdfDownloader = pdfDownloader ?? new PdfDownloader();
+    this.sessionManager = sessionManager;
+    this.pdfPrinter = pdfPrinter;
+    this.orchestrator = orchestrator ?? new ExportOrchestrator(sessionManager, pdfPrinter);
   }
 
   handleMessage(
     message: ExtensionMessage,
-    sender: chrome.runtime.MessageSender,
-    sendResponse: (response?: unknown) => void
-  ): boolean {
+    sender: browser.runtime.MessageSender
+  ): Promise<unknown> | undefined {
     logger.debug(`Received message [${message.type}] from tab ${sender.tab?.id ?? 'unknown'}`);
 
     switch (message.type) {
       case 'PING':
-        sendResponse({ type: 'PONG', timestamp: Date.now() });
-        return false;
+        return Promise.resolve({ type: 'PONG', timestamp: Date.now() });
 
       case 'GET_STATUS':
-        sendResponse({
+        return Promise.resolve({
           type: 'STATUS_RESPONSE',
           payload: this.currentProgress
         });
-        return false;
 
       case 'START_TEST_PRINT':
-        this.handleStartTestPrint(message, sender, sendResponse);
-        return true; // Keep channel open for async
+        return this.handleStartTestPrint(message, sender);
 
       case 'START_EXPORT':
-        this.handleStartExport(message, sender, sendResponse);
-        return true;
+        return this.handleStartExport(message, sender);
 
       case 'STOP_EXPORT':
-        this.handleStopExport(message, sender, sendResponse);
-        return true;
+        return this.handleStopExport(message);
 
       default:
-        return false;
+        return undefined;
     }
   }
 
   /**
-   * Phase 2: Single active chapter clean test print
+   * Single active chapter export via Firefox Native Vector (`browser.tabs.saveAsPDF`)
    */
   private async handleStartTestPrint(
     message: Extract<ExtensionMessage, { type: 'START_TEST_PRINT' }>,
-    sender: chrome.runtime.MessageSender,
-    sendResponse: (response?: unknown) => void
-  ): Promise<void> {
+    sender: browser.runtime.MessageSender
+  ): Promise<unknown> {
     const tabId = sender.tab?.id;
     if (!tabId) {
-      sendResponse({ success: false, error: 'Tidak ditemukan tab aktif pada pengirim.' });
-      return;
+      return { success: false, error: 'Tidak ditemukan tab aktif pada pengirim.' };
     }
+
+    if (this.orchestrator.isRunning() || this.isFinalizing) {
+      return {
+        success: false,
+        error: 'Sesi ekspor lain sedang berjalan. Tunggu selesai atau klik Berhenti terlebih dahulu.'
+      };
+    }
+
+    const bookTitle = message.payload?.bookTitle || 'BMP_UT';
+    const api = getBrowserApi();
 
     try {
       this.activeTabId = tabId;
-      this.updateProgress({
-        status: 'INITIALIZING',
-        currentChapter: 1,
-        totalChaptersEstimated: 1,
-        chapterTitle: message.payload?.chapterTitle || 'Halaman Aktif',
-        moduleLabel: 'Halaman Aktif',
-        phaseLabel: 'Inisialisasi',
-        percent: 10,
-        message: 'Menghubungkan browser ke tab Kotobee...'
-      }, tabId);
+      await this.sessionManager.startSession(tabId);
 
-      // 1. Attach debugger
-      await this.debuggerManager.attach(tabId);
-      await this.cdpPrinter.prepare();
+      this.updateProgress(
+        {
+          status: 'CAPTURING_PAGE',
+          currentChapter: 1,
+          totalChaptersEstimated: 1,
+          chapterTitle: message.payload?.chapterTitle || 'Halaman Aktif',
+          moduleLabel: 'Halaman Aktif',
+          phaseLabel: 'Menyiapkan',
+          percent: 45,
+          message: 'Menyiapkan panggung cetak vektor halaman aktif...'
+        },
+        tabId
+      );
 
-      // 2. Prepare page (isolated print stage)
-      this.updateProgress({
-        status: 'CAPTURING_PAGE',
-        currentChapter: 1,
-        totalChaptersEstimated: 1,
-        chapterTitle: message.payload?.chapterTitle || 'Halaman Aktif',
-        moduleLabel: 'Halaman Aktif',
-        phaseLabel: 'Menyiapkan',
-        percent: 45,
-        message: 'Menyiapkan halaman bersih & memproses gambar...'
-      }, tabId);
+      const prepResult = (await api.tabs.sendMessage(tabId, {
+        type: 'PREPARE_FOR_PRINT'
+      })) as PrepareForPrintResponse;
 
-      let prepResult: PrepareForPrintResponse = { success: false, chapterTitle: 'Bab_Aktif' };
-      try {
-        prepResult = await chrome.tabs.sendMessage(tabId, {
-          type: 'PREPARE_FOR_PRINT'
-        }) as PrepareForPrintResponse;
-      } catch (prepErr) {
-        logger.warn('Failed to communicate PREPARE_FOR_PRINT with tab:', prepErr);
-      }
-
-      if (!prepResult.success) {
-        throw new Error(prepResult.error || 'Gagal menyiapkan isolated print stage pada halaman Kotobee.');
+      if (!prepResult?.success) {
+        throw new Error(prepResult?.error || 'Gagal menyiapkan panggung cetak vektor pada halaman Kotobee.');
       }
 
       const chapterTitle = prepResult.chapterTitle || message.payload?.chapterTitle || 'Bab_Aktif';
-      const bookTitle = message.payload?.bookTitle || 'BMP_UT';
+      const filename = sanitizeFilename(`${bookTitle}_${chapterTitle}`);
 
-      // 3. Print to PDF via CDP
-      this.updateProgress({
-        status: 'CAPTURING_PAGE',
-        currentChapter: 1,
-        totalChaptersEstimated: 1,
-        chapterTitle,
-        moduleLabel: 'Halaman Aktif',
-        phaseLabel: 'Cetak PDF',
-        percent: 75,
-        message: 'Mencetak halaman aktif ke PDF...'
-      }, tabId);
+      this.updateProgress(
+        {
+          status: 'STITCHING',
+          currentChapter: 1,
+          totalChaptersEstimated: 1,
+          chapterTitle,
+          moduleLabel: 'Halaman Aktif',
+          phaseLabel: 'Simpan PDF',
+          percent: 85,
+          message: 'Membuka dialog Save As PDF vektor Firefox...'
+        },
+        tabId
+      );
 
-      const { base64, buffer } = await this.cdpPrinter.printCurrentPage({
-        printBackground: true,
-        generateTaggedPDF: true,
-        ...(prepResult.isFixedLayout ? { pageRanges: '1' } : {})
-      });
-
-      // 4. Restore original page styles
+      let saveStatus: VectorSaveStatus = 'saved';
       try {
-        await chrome.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' });
-      } catch (restoreErr) {
-        logger.warn('Failed to send RESTORE_AFTER_PRINT:', restoreErr);
+        saveStatus = await this.pdfPrinter.saveConsolidatedVectorPdf(tabId, filename);
+      } finally {
+        await api.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
       }
 
-      // 5. Detach debugger immediately
-      await this.debuggerManager.detach();
+      const isCanceled = saveStatus === 'canceled';
+      this.updateProgress(
+        {
+          status: isCanceled ? 'STOPPED' : 'COMPLETED',
+          currentChapter: 1,
+          totalChaptersEstimated: 1,
+          chapterTitle,
+          moduleLabel: 'Halaman Aktif',
+          phaseLabel: isCanceled ? 'Dibatalkan' : 'Selesai',
+          percent: isCanceled ? 0 : 100,
+          capturedCount: isCanceled ? 0 : 1,
+          message: isCanceled
+            ? 'Dialog simpan PDF dibatalkan pengguna.'
+            : saveStatus === 'fallback-print'
+              ? 'Dialog cetak sistem dibuka — pilih "Save to PDF" untuk menyimpan.'
+              : `Berhasil! ${filename} (Vektor) telah disimpan.`
+        },
+        tabId
+      );
 
-      // 6. Download single page PDF file
-      this.updateProgress({
-        status: 'STITCHING',
-        currentChapter: 1,
-        totalChaptersEstimated: 1,
-        chapterTitle,
-        moduleLabel: 'Halaman Aktif',
-        phaseLabel: 'Mengunduh',
-        percent: 95,
-        message: 'Menyimpan file PDF halaman aktif...'
-      }, tabId);
-
-      const filename = sanitizeFilename(`${bookTitle}_${chapterTitle}`);
-      await this.savePdfFile(tabId, base64, filename);
-
-      this.updateProgress({
-        status: 'COMPLETED',
-        currentChapter: 1,
-        totalChaptersEstimated: 1,
-        chapterTitle,
-        moduleLabel: 'Halaman Aktif',
-        phaseLabel: 'Selesai',
-        percent: 100,
-        capturedCount: 1,
-        totalBytes: buffer.byteLength,
-        message: `Berhasil! ${filename} telah diunduh.`
-      }, tabId);
-
-      sendResponse({
-        success: true,
-        message: `File berhasil diunduh: ${filename}`,
+      return {
+        success: !isCanceled,
+        message: isCanceled
+          ? 'Penyimpanan PDF dibatalkan pengguna.'
+          : `File vektor berhasil disimpan: ${filename}`,
         filename,
-        fileSizeMb: (buffer.byteLength / 1024 / 1024).toFixed(2)
-      });
+        vectorSaveStatus: saveStatus
+      };
     } catch (err) {
-      const errorMsg = DebuggerManager.formatFriendlyError(err);
+      const errorMsg = TabSessionManager.formatFriendlyError(err);
       logger.error('Error during handleStartTestPrint:', err);
 
-      // Guarantee cleanup
-      try {
-        if (tabId) {
-          await chrome.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
-        }
-      } catch {
-        // Ignore secondary error
-      }
-      await this.debuggerManager.detach().catch(() => {});
+      await api.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
 
-      this.updateProgress({
-        status: 'ERROR',
-        currentChapter: 0,
-        chapterTitle: 'Error',
-        phaseLabel: 'Error',
-        message: `Gagal cetak halaman aktif: ${errorMsg}`
-      }, tabId);
+      this.updateProgress(
+        {
+          status: 'ERROR',
+          currentChapter: 0,
+          chapterTitle: 'Error',
+          phaseLabel: 'Error',
+          message: `Gagal cetak halaman aktif: ${errorMsg}`
+        },
+        tabId
+      );
 
-      sendResponse({ success: false, error: errorMsg });
+      return { success: false, error: errorMsg };
     } finally {
+      this.sessionManager.endSession();
       this.activeTabId = null;
     }
   }
 
   /**
-   * Phase 3 + Phase 4: Multi-chapter auto-navigation capture, incremental pdf-lib stitching,
-   * hierarchical bookmarks, and automatic download (including Stop & Save Partial).
+   * Multi-chapter module / page-range Native Vector export:
+   * Collects clean DOM snapshots across [startChapter .. endChapter], mounts a single
+   * consolidated `@media print` stage, and invokes `browser.tabs.saveAsPDF()` once.
    */
   private async handleStartExport(
     message: Extract<ExtensionMessage, { type: 'START_EXPORT' }>,
-    sender: chrome.runtime.MessageSender,
-    sendResponse: (response?: unknown) => void
-  ): Promise<void> {
+    sender: browser.runtime.MessageSender
+  ): Promise<unknown> {
     const tabId = sender.tab?.id;
     if (!tabId) {
-      sendResponse({ success: false, error: 'Tidak ditemukan tab aktif pada pengirim.' });
-      return;
+      return { success: false, error: 'Tidak ditemukan tab aktif pada pengirim.' };
     }
 
     if (this.orchestrator.isRunning() || this.isFinalizing) {
-      sendResponse({
+      return {
         success: false,
-        error: 'Sesi ekspor atau penggabungan PDF sedang berjalan. Tunggu selesai atau klik Berhenti terlebih dahulu.'
-      });
-      return;
+        error: 'Sesi ekspor sedang berjalan. Tunggu selesai atau klik Berhenti terlebih dahulu.'
+      };
     }
 
     const incomingRange = message.payload?.range;
-    const range: ExportRangeRequest = incomingRange ?? {
-      startChapter: 0,
-      endChapter: 0,
-      label: message.payload?.bookTitle || 'Bab Aktif',
-      bookTitle: message.payload?.bookTitle || 'BMP_UT',
-      savePerPageDebug: false
-    };
+    const range: ExportRangeRequest = incomingRange
+      ? { ...incomingRange, exportMode: 'native-vector' }
+      : {
+          startChapter: 0,
+          endChapter: 0,
+          label: message.payload?.bookTitle || 'Bab Aktif',
+          bookTitle: message.payload?.bookTitle || 'BMP_UT',
+          exportMode: 'native-vector'
+        };
 
     if (range.startChapter < 0 || range.endChapter < range.startChapter) {
-      sendResponse({
+      return {
         success: false,
         error: `Rentang chapter tidak valid (${range.startChapter} s.d. ${range.endChapter}).`
-      });
-      return;
+      };
     }
 
     const bookTitle = range.bookTitle || message.payload?.bookTitle || 'BMP_UT';
-    const assembler = new PdfAssembler();
-    try {
-      await assembler.init({
-        bookTitle,
-        label: range.label,
-        author: range.bookAuthor
-      });
-    } catch (initErr) {
-      const msg = initErr instanceof Error ? initErr.message : String(initErr);
-      sendResponse({ success: false, error: `Gagal inisialisasi PDF Assembler: ${msg}` });
-      return;
-    }
 
-    // Reset progress to INITIALIZING synchronously before acknowledging start
-    // so widget polling never reads stale COMPLETED/STOPPED/ERROR from a previous session.
     this.activeTabId = tabId;
-    this.updateProgress({
-      status: 'INITIALIZING',
-      currentChapter: 0,
-      currentChapterIndex: range.startChapter,
-      totalChaptersEstimated: range.endChapter - range.startChapter + 1,
-      chapterTitle: range.label,
-      moduleLabel: range.label,
-      startChapter: range.startChapter,
-      endChapter: range.endChapter,
-      phaseLabel: 'Inisialisasi',
-      message: `Memulai ekspor untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`,
-      percent: 0,
-      capturedCount: 0,
-      failedCount: 0,
-      totalBytes: 0,
-      startedAt: Date.now(),
-      etaSeconds: null
-    }, tabId);
+    this.updateProgress(
+      {
+        status: 'INITIALIZING',
+        currentChapter: 0,
+        currentChapterIndex: range.startChapter,
+        totalChaptersEstimated: range.endChapter - range.startChapter + 1,
+        chapterTitle: range.label,
+        moduleLabel: range.label,
+        startChapter: range.startChapter,
+        endChapter: range.endChapter,
+        phaseLabel: 'Inisialisasi',
+        message: `Memulai ekspor Vektor Native untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`,
+        percent: 0,
+        capturedCount: 0,
+        failedCount: 0,
+        totalBytes: 0,
+        startedAt: Date.now(),
+        etaSeconds: null
+      },
+      tabId
+    );
 
-    // Acknowledge start immediately so long-running batches never hit sendMessage IPC timeouts;
-    // live updates are delivered via real-time EXPORT_PROGRESS push + GET_STATUS fallback polling.
-    sendResponse({
-      success: true,
-      message: `Memulai ekspor untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`
-    });
+    const api = getBrowserApi();
 
-    // Launch batch export + incremental stitching asynchronously
-    this.orchestrator
+    void this.orchestrator
       .runBatchExport(tabId, range, message.payload?.config, {
         onProgress: (progress) => this.updateProgress(progress, tabId),
-        savePdfFile: (tId, base64, filename) => this.savePdfFile(tId, base64, filename),
-        deferTerminalStatus: true,
-        onChapterCaptured: async (buffer, meta) => {
-          await assembler.appendChapter(buffer, meta);
-        }
+        deferTerminalStatus: true
       })
       .then(async (summary) => {
-        logger.info('Batch capture finished; entering Phase 4 finalization:', {
+        logger.info('Batch vector snapshot collection finished; mounting consolidated print stage:', {
           status: summary.status,
           captured: summary.capturedCount,
           totalRequested: summary.totalRequested,
-          totalBytes: summary.totalBytes,
           lastChapterIndex: summary.lastChapterIndex
         });
 
         this.isFinalizing = true;
         try {
-          // Stitch & download merged PDF if >= 1 chapter was captured (including Stop & Error Partial Save)
-          if (summary.capturedCount > 0 && assembler.getTotalPages() > 0) {
+          if (summary.capturedCount > 0) {
             const isPartial =
               summary.status !== 'COMPLETED' || summary.capturedCount < summary.totalRequested;
             summary.isPartial = isPartial;
-
-            this.updateProgress({
-              status: 'STITCHING',
-              currentChapter: summary.capturedCount,
-              currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
-              totalChaptersEstimated: summary.totalRequested,
-              chapterTitle: range.label,
-              moduleLabel: range.label,
-              phaseLabel: 'Menggabungkan',
-              message: isPartial
-                ? `Menyelamatkan PDF parsial (${summary.capturedCount} hal) & menyusun bookmarks...`
-                : `Menggabungkan ${summary.capturedCount} hal & menyusun bookmarks PDF...`,
-              percent: isPartial
-                ? Math.round((summary.capturedCount / summary.totalRequested) * 100)
-                : 99,
-              capturedCount: summary.capturedCount,
-              failedCount: summary.failedCount,
-              totalBytes: summary.totalBytes,
-              etaSeconds: 0
-            }, tabId);
-
-            const assembled = await assembler.finalize(range.tocItems, { isPartial });
 
             const rawName = isPartial
               ? `${bookTitle}_${range.label}_Partial_ch${summary.startChapter}-${summary.lastChapterIndex ?? summary.startChapter}`
               : `${bookTitle}_${range.label}`;
             const outputFilename = sanitizeFilename(rawName);
-            const sizeMb = (assembled.bytes.byteLength / 1024 / 1024).toFixed(2);
 
-            this.updateProgress({
-              status: 'STITCHING',
-              currentChapter: summary.capturedCount,
-              currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
-              totalChaptersEstimated: summary.totalRequested,
-              chapterTitle: range.label,
-              moduleLabel: range.label,
-              phaseLabel: 'Mengunduh',
-              message: `Mengunduh ${outputFilename} (${sizeMb} MB, ${assembled.bookmarkCount} bookmarks)...`,
-              percent: 99,
-              capturedCount: summary.capturedCount,
-              failedCount: summary.failedCount,
-              totalBytes: assembled.bytes.byteLength,
-              etaSeconds: 0
-            }, tabId);
+            const mountRes = (await api.tabs.sendMessage(tabId, {
+              type: 'MOUNT_VECTOR_PRINT_STAGE'
+            })) as MountVectorPrintStageResponse;
 
-            const dlResult = await this.pdfDownloader.downloadBytes(
-              tabId,
-              assembled.bytes,
-              outputFilename
-            );
+            if (!mountRes?.success || mountRes.snapshotCount === 0) {
+              throw new Error(mountRes?.error || 'Gagal memasang panggung cetak vektor gabungan.');
+            }
 
-            summary.outputFilename = outputFilename;
-            summary.outputBytes = assembled.bytes.byteLength;
-            summary.totalPdfPages = assembled.totalPages;
-            summary.bookmarkCount = assembled.bookmarkCount;
-            summary.downloadId = dlResult.downloadId;
-
-            if (summary.status === 'COMPLETED') {
-              const skippedSuffix =
-                summary.failedCount > 0 ? ` (${summary.failedCount} hal dilewati)` : '';
-              this.updateProgress({
-                status: 'COMPLETED',
+            this.updateProgress(
+              {
+                status: 'STITCHING',
                 currentChapter: summary.capturedCount,
-                currentChapterIndex: summary.lastChapterIndex ?? summary.endChapter,
+                currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
                 totalChaptersEstimated: summary.totalRequested,
                 chapterTitle: range.label,
                 moduleLabel: range.label,
-                phaseLabel: 'Selesai',
-                message: `Selesai! ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB, ${assembled.bookmarkCount} bookmarks)${skippedSuffix}.`,
-                percent: 100,
+                phaseLabel: 'Simpan Vektor',
+                message: `Membuka dialog Save As PDF untuk ${outputFilename} (${mountRes.snapshotCount} halaman)...`,
+                percent: 99,
                 capturedCount: summary.capturedCount,
                 failedCount: summary.failedCount,
-                totalBytes: assembled.bytes.byteLength,
+                totalBytes: summary.totalBytes,
                 etaSeconds: 0
-              }, tabId);
+              },
+              tabId
+            );
 
-              await chrome.tabs
-                .sendMessage(tabId, {
-                  type: 'EXPORT_COMPLETE',
-                  payload: {
-                    filename: outputFilename,
-                    totalChapters: summary.capturedCount,
-                    totalPdfPages: assembled.totalPages,
-                    bookmarkCount: assembled.bookmarkCount,
-                    outputBytes: assembled.bytes.byteLength,
-                    isPartial: summary.failedCount > 0,
-                    downloadId: dlResult.downloadId,
-                    summary
-                  }
-                })
-                .catch(() => {});
-            } else if (summary.status === 'STOPPED') {
-              this.updateProgress({
-                status: 'STOPPED',
+            let saveStatus: VectorSaveStatus = 'saved';
+            try {
+              saveStatus = await this.pdfPrinter.saveConsolidatedVectorPdf(tabId, outputFilename);
+            } finally {
+              await api.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
+              await api.tabs.sendMessage(tabId, { type: 'CLEAR_VECTOR_SNAPSHOTS' }).catch(() => {});
+            }
+
+            summary.outputFilename = outputFilename;
+            summary.totalPdfPages = mountRes.snapshotCount;
+            summary.vectorSaveStatus = saveStatus;
+
+            const isCanceled = saveStatus === 'canceled';
+            const finalUiStatus = isCanceled
+              ? 'STOPPED'
+              : summary.status === 'ERROR'
+                ? 'ERROR'
+                : summary.status === 'STOPPED'
+                  ? 'STOPPED'
+                  : 'COMPLETED';
+
+            const statusMsg = isCanceled
+              ? `Dialog simpan PDF dibatalkan (${mountRes.snapshotCount} halaman sempat dikumpulkan).`
+              : saveStatus === 'fallback-print'
+                ? `Dialog cetak sistem dibuka (${mountRes.snapshotCount} halaman). Pilih "Save to PDF".`
+                : `Selesai! PDF Vektor disimpan: ${outputFilename} (${mountRes.snapshotCount} hal).`;
+
+            this.updateProgress(
+              {
+                status: finalUiStatus,
                 currentChapter: summary.capturedCount,
-                currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
+                currentChapterIndex: summary.lastChapterIndex ?? summary.endChapter,
                 totalChaptersEstimated: summary.totalRequested,
-                chapterTitle: 'Dihentikan (Parsial Tersimpan)',
+                chapterTitle: isCanceled ? 'Dibatalkan' : range.label,
                 moduleLabel: range.label,
-                phaseLabel: 'Parsial',
-                message: `Dihentikan. PDF parsial disimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB, ${assembled.bookmarkCount} bookmarks).`,
-                percent: Math.round((summary.capturedCount / summary.totalRequested) * 100),
+                phaseLabel: isCanceled ? 'Dibatalkan' : isPartial ? 'Parsial' : 'Selesai',
+                message: statusMsg,
+                percent:
+                  finalUiStatus === 'COMPLETED'
+                    ? 100
+                    : Math.round((summary.capturedCount / summary.totalRequested) * 100),
                 capturedCount: summary.capturedCount,
                 failedCount: summary.failedCount,
-                totalBytes: assembled.bytes.byteLength,
-                etaSeconds: null
-              }, tabId);
+                totalBytes: summary.totalBytes,
+                etaSeconds: 0
+              },
+              tabId
+            );
 
-              await chrome.tabs
-                .sendMessage(tabId, {
-                  type: 'EXPORT_COMPLETE',
-                  payload: {
-                    filename: outputFilename,
-                    totalChapters: summary.capturedCount,
-                    totalPdfPages: assembled.totalPages,
-                    bookmarkCount: assembled.bookmarkCount,
-                    outputBytes: assembled.bytes.byteLength,
-                    isPartial: true,
-                    downloadId: dlResult.downloadId,
-                    summary
-                  }
-                })
-                .catch(() => {});
-            } else {
-              // ERROR mid-batch, but partial PDF was rescued and saved!
-              this.updateProgress({
-                status: 'ERROR',
-                currentChapter: summary.capturedCount,
-                currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
-                totalChaptersEstimated: summary.totalRequested,
-                chapterTitle: 'Error (Parsial Tersimpan)',
-                moduleLabel: range.label,
-                phaseLabel: 'Error (Parsial)',
-                message: `Terhenti karena error, namun PDF parsial tersimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB).`,
-                percent: Math.round((summary.capturedCount / summary.totalRequested) * 100),
-                capturedCount: summary.capturedCount,
-                failedCount: summary.failedCount,
-                totalBytes: assembled.bytes.byteLength,
-                etaSeconds: null
-              }, tabId);
-
-              await chrome.tabs
+            if (summary.status === 'ERROR' && !isCanceled) {
+              await api.tabs
                 .sendMessage(tabId, {
                   type: 'EXPORT_ERROR',
                   payload: {
                     message: summary.errorMessage || 'Ekspor terhenti di tengah proses.',
-                    details: `PDF parsial tersimpan: ${outputFilename} (${assembled.totalPages} hal, ${sizeMb} MB).`,
+                    details: `PDF vektor parsial disimpan: ${outputFilename} (${mountRes.snapshotCount} hal).`,
                     recoverable: summary.resumeFromChapter !== null && summary.resumeFromChapter !== undefined,
                     partialFilename: outputFilename,
                     summary
                   }
                 })
                 .catch(() => {});
-            }
-          } else {
-            // 0 chapters captured — emit terminal error/stopped without creating empty PDF
-            if (summary.status === 'ERROR') {
-              await chrome.tabs
-                .sendMessage(tabId, {
-                  type: 'EXPORT_ERROR',
-                  payload: {
-                    message: summary.errorMessage || 'Ekspor rentang halaman gagal.',
-                    details: '0 halaman berhasil ditangkap.',
-                    summary
-                  }
-                })
-                .catch(() => {});
             } else {
-              await chrome.tabs
+              await api.tabs
                 .sendMessage(tabId, {
                   type: 'EXPORT_COMPLETE',
                   payload: {
-                    filename: range.label,
-                    totalChapters: 0,
-                    isPartial: true,
+                    filename: outputFilename,
+                    totalChapters: summary.capturedCount,
+                    totalPdfPages: mountRes.snapshotCount,
+                    isPartial: isPartial || isCanceled,
+                    vectorSaveStatus: saveStatus,
                     summary
                   }
                 })
                 .catch(() => {});
             }
+          } else {
+            await api.tabs.sendMessage(tabId, { type: 'CLEAR_VECTOR_SNAPSHOTS' }).catch(() => {});
+            await this.emitZeroCapturedTerminal(tabId, range, summary);
           }
-        } catch (stitchErr) {
-          const errMsg = stitchErr instanceof Error ? stitchErr.message : String(stitchErr);
-          logger.error('Error during Phase 4 PDF stitching/download:', stitchErr);
-          this.updateProgress({
-            status: 'ERROR',
-            currentChapter: summary.capturedCount,
-            currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
-            totalChaptersEstimated: summary.totalRequested,
-            chapterTitle: 'Error Stitching',
-            message: `Gagal menggabungkan/mengunduh PDF: ${errMsg}`
-          });
+        } catch (err) {
+          const errMsg = TabSessionManager.formatFriendlyError(err);
+          logger.error('Error during Native Vector finalization:', err);
+          await api.tabs.sendMessage(tabId, { type: 'RESTORE_AFTER_PRINT' }).catch(() => {});
+          await api.tabs.sendMessage(tabId, { type: 'CLEAR_VECTOR_SNAPSHOTS' }).catch(() => {});
 
-          await chrome.tabs
+          this.updateProgress(
+            {
+              status: 'ERROR',
+              currentChapter: summary.capturedCount,
+              currentChapterIndex: summary.lastChapterIndex ?? summary.startChapter,
+              totalChaptersEstimated: summary.totalRequested,
+              chapterTitle: 'Error Simpan PDF',
+              message: `Gagal menyimpan PDF vektor: ${errMsg}`
+            },
+            tabId
+          );
+
+          await api.tabs
             .sendMessage(tabId, {
               type: 'EXPORT_ERROR',
               payload: {
-                message: `Gagal menggabungkan/mengunduh PDF: ${errMsg}`,
-                details: `${summary.capturedCount} halaman telah ditangkap sebelum gagal.`
+                message: `Gagal menyimpan PDF vektor: ${errMsg}`,
+                details: `${summary.capturedCount} halaman telah direkam sebelum gagal.`
               }
             })
             .catch(() => {});
         } finally {
-          assembler.dispose();
           this.isFinalizing = false;
           this.activeTabId = null;
         }
       })
       .catch((err) => {
-        assembler.dispose();
         this.isFinalizing = false;
         this.activeTabId = null;
         logger.error('Unhandled error in orchestrator.runBatchExport:', err);
       });
+
+    return {
+      success: true,
+      message: `Memulai ekspor Vektor Native untuk ${range.label} (ch/${range.startChapter}–${range.endChapter})...`
+    };
+  }
+
+  private async emitZeroCapturedTerminal(
+    tabId: number,
+    range: ExportRangeRequest,
+    summary: import('../types/exporter').BatchExportSummary
+  ): Promise<void> {
+    const api = getBrowserApi();
+    if (summary.status === 'ERROR') {
+      await api.tabs
+        .sendMessage(tabId, {
+          type: 'EXPORT_ERROR',
+          payload: {
+            message: summary.errorMessage || 'Ekspor rentang halaman gagal.',
+            details: '0 halaman berhasil direkam.',
+            summary
+          }
+        })
+        .catch(() => {});
+    } else {
+      await api.tabs
+        .sendMessage(tabId, {
+          type: 'EXPORT_COMPLETE',
+          payload: {
+            filename: range.label,
+            totalChapters: 0,
+            isPartial: true,
+            summary
+          }
+        })
+        .catch(() => {});
+    }
   }
 
   private async handleStopExport(
-    message: Extract<ExtensionMessage, { type: 'STOP_EXPORT' }>,
-    _sender: chrome.runtime.MessageSender,
-    sendResponse: (response?: unknown) => void
-  ): Promise<void> {
+    message: Extract<ExtensionMessage, { type: 'STOP_EXPORT' }>
+  ): Promise<unknown> {
     logger.info('Stopping export session by user request.');
     await this.orchestrator.stop(message.reason || 'User manual stop', (progress) =>
       this.updateProgress(progress, this.activeTabId ?? undefined)
     );
     if (!this.orchestrator.isRunning() && !this.isFinalizing) {
-      await this.debuggerManager.detach().catch(() => {});
-      this.updateProgress({
-        status: 'STOPPED',
-        currentChapter: 0,
-        chapterTitle: 'Dihentikan',
-        phaseLabel: 'Dihentikan',
-        message: 'Proses ekspor dihentikan oleh pengguna.'
-      }, this.activeTabId ?? undefined);
+      this.sessionManager.endSession();
+      this.updateProgress(
+        {
+          status: 'STOPPED',
+          currentChapter: 0,
+          chapterTitle: 'Dihentikan',
+          phaseLabel: 'Dihentikan',
+          message: 'Proses ekspor dihentikan oleh pengguna.'
+        },
+        this.activeTabId ?? undefined
+      );
     }
-    sendResponse({ success: true, message: 'Permintaan berhenti diterima.' });
-  }
-
-  /**
-   * Saves the generated PDF using chrome.downloads or falls back to in-page blob download
-   */
-  private async savePdfFile(tabId: number, base64: string, filename: string): Promise<void> {
-    try {
-      // First try standard chrome.downloads API
-      const dataUri = `data:application/pdf;base64,${base64}`;
-      await chrome.downloads.download({
-        url: dataUri,
-        filename,
-        saveAs: false
-      });
-      logger.info(`Download initiated successfully via chrome.downloads for ${filename}`);
-    } catch (downloadErr) {
-      logger.warn('Direct chrome.downloads failed, falling back to in-page Blob download:', downloadErr);
-      await chrome.tabs.sendMessage(tabId, {
-        type: 'DOWNLOAD_PDF_BLOB',
-        payload: {
-          base64Data: base64,
-          filename
-        }
-      });
-    }
+    return { success: true, message: 'Permintaan berhenti diterima.' };
   }
 
   private updateProgress(progress: ExportProgress, tabId?: number): void {
     this.currentProgress = progress;
     const targetTabId = tabId ?? this.activeTabId;
-    if (targetTabId !== null && typeof chrome !== 'undefined' && chrome.tabs?.sendMessage) {
-      chrome.tabs
-        .sendMessage(targetTabId, {
-          type: 'EXPORT_PROGRESS',
-          payload: progress
-        })
-        .catch(() => {
-          // Tab may be busy or closed; widget also reconciles via GET_STATUS fallback
-        });
+    if (targetTabId !== null && hasBrowserApi()) {
+      const api = getBrowserApi();
+      if (api.tabs?.sendMessage) {
+        api.tabs
+          .sendMessage(targetTabId, {
+            type: 'EXPORT_PROGRESS',
+            payload: progress
+          })
+          .catch(() => {
+            // Tab may be busy or closed; widget also reconciles via GET_STATUS fallback
+          });
+      }
     }
   }
 }

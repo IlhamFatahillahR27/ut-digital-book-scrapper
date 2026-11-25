@@ -6,7 +6,7 @@ const isWatch = process.argv.includes('--watch');
 const distDir = path.resolve('dist');
 const publicDir = path.resolve('public');
 
-const EXCLUDED_PUBLIC_FILES = new Set(['icon_ut.png', '.DS_Store', 'Thumbs.db']);
+const EXCLUDED_PUBLIC_FILES = new Set(['icon_ut.png', 'offscreen.html', '.DS_Store', 'Thumbs.db']);
 
 function copyPublicAssets() {
   if (fs.existsSync(publicDir)) {
@@ -17,20 +17,20 @@ function copyPublicAssets() {
         return !EXCLUDED_PUBLIC_FILES.has(base);
       }
     });
-    console.log('[Build] Copied clean public assets (manifest.json, offscreen.html, icons/) to dist/');
+    console.log('[Build] Copied clean public assets (manifest.json, icons/) to dist/');
   }
 }
 
 async function runBuild() {
-  console.log('[Build] Starting extension build...');
+  console.log('[Build] Starting Firefox MV3 extension build...');
 
   if (!isWatch && fs.existsSync(distDir)) {
     fs.rmSync(distDir, { recursive: true, force: true });
   }
   fs.mkdirSync(distDir, { recursive: true });
 
-  // 1. Build Background Service Worker (ES Module)
-  console.log('[Build] Bundling Background Service Worker (ESM)...');
+  // 1. Build Background Event Page Script (ES Module for Firefox MV3 background.scripts)
+  console.log('[Build] Bundling Background Event Page Script (ESM)...');
   await build({
     configFile: false,
     publicDir: false,
@@ -78,35 +78,10 @@ async function runBuild() {
     }
   });
 
-  // 3. Build Offscreen Document Script (IIFE for MV3 Blob URL creation)
-  console.log('[Build] Bundling Offscreen Script (IIFE)...');
-  await build({
-    configFile: false,
-    publicDir: false,
-    build: {
-      outDir: distDir,
-      emptyOutDir: false,
-      sourcemap: isWatch,
-      lib: {
-        entry: path.resolve('src/offscreen/index.ts'),
-        formats: ['iife'],
-        name: 'RbvUtOffscreenScript',
-        fileName: () => 'offscreen.js'
-      },
-      watch: isWatch ? {} : null,
-      rollupOptions: {
-        output: {
-          entryFileNames: 'offscreen.js',
-          extend: true
-        }
-      }
-    }
-  });
-
-  // 4. Copy public assets
+  // 3. Copy public assets
   copyPublicAssets();
 
-  console.log('✅ [Build] Build completed successfully! Extension is ready in dist/\n');
+  console.log('✅ [Build] Firefox Add-on build completed successfully! Ready in dist/\n');
 }
 
 runBuild().catch((err) => {

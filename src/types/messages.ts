@@ -1,17 +1,21 @@
 import type {
   BatchExportSummary,
   BookStructureInfo,
+  ExportMode,
   ExportProgress,
   ExportRangeRequest,
-  ExporterConfig
+  ExporterConfig,
+  VectorSaveStatus
 } from './exporter';
 
 export type {
   BatchExportSummary,
   BookStructureInfo,
+  ExportMode,
   ExportProgress,
   ExportRangeRequest,
-  ExporterConfig
+  ExporterConfig,
+  VectorSaveStatus
 };
 
 export type MessageType =
@@ -28,18 +32,13 @@ export type MessageType =
   | 'TOGGLE_WIDGET'
   | 'START_EXPORT'
   | 'START_TEST_PRINT'
-  | 'PRINT_ISOLATED_PAGE'
   | 'STOP_EXPORT'
   | 'PREPARE_FOR_PRINT'
   | 'RESTORE_AFTER_PRINT'
-  | 'DOWNLOAD_PDF_BLOB'
-  | 'DOWNLOAD_PDF_CHUNK_INIT'
-  | 'DOWNLOAD_PDF_CHUNK_APPEND'
-  | 'DOWNLOAD_PDF_CHUNK_FINALIZE'
-  | 'OFFSCREEN_BLOB_INIT'
-  | 'OFFSCREEN_BLOB_CHUNK'
-  | 'OFFSCREEN_BLOB_FINALIZE'
-  | 'OFFSCREEN_BLOB_REVOKE'
+  | 'CAPTURE_VECTOR_SNAPSHOT'
+  | 'MOUNT_VECTOR_PRINT_STAGE'
+  | 'CLEAR_VECTOR_SNAPSHOTS'
+  | 'TRIGGER_WINDOW_PRINT'
   | 'EXPORT_PROGRESS'
   | 'EXPORT_COMPLETE'
   | 'EXPORT_ERROR';
@@ -156,17 +155,6 @@ export interface StartTestPrintMessage {
   };
 }
 
-export interface PrintIsolatedPageMessage {
-  type: 'PRINT_ISOLATED_PAGE';
-  payload: {
-    html: string;
-    headHtml: string;
-    baseUri: string;
-    chapterTitle: string;
-    bookTitle: string;
-  };
-}
-
 export interface StopExportMessage {
   type: 'STOP_EXPORT';
   reason?: string;
@@ -192,69 +180,39 @@ export interface RestoreAfterPrintResponse {
   success: boolean;
 }
 
-export interface DownloadPdfBlobMessage {
-  type: 'DOWNLOAD_PDF_BLOB';
+export interface CaptureVectorSnapshotMessage {
+  type: 'CAPTURE_VECTOR_SNAPSHOT';
   payload: {
-    base64Data: string;
-    filename: string;
+    sequenceNumber: number;
+    chapterIndex: number;
   };
 }
 
-export interface DownloadPdfChunkInitMessage {
-  type: 'DOWNLOAD_PDF_CHUNK_INIT';
-  payload: {
-    jobId: string;
-    filename: string;
-  };
+export interface CaptureVectorSnapshotResponse {
+  success: boolean;
+  chapterTitle: string;
+  isFixedLayout: boolean;
+  estimatedBytes: number;
+  snapshotCount: number;
+  error?: string;
 }
 
-export interface DownloadPdfChunkAppendMessage {
-  type: 'DOWNLOAD_PDF_CHUNK_APPEND';
-  payload: {
-    jobId: string;
-    base64Chunk: string;
-  };
+export interface MountVectorPrintStageMessage {
+  type: 'MOUNT_VECTOR_PRINT_STAGE';
 }
 
-export interface DownloadPdfChunkFinalizeMessage {
-  type: 'DOWNLOAD_PDF_CHUNK_FINALIZE';
-  payload: {
-    jobId: string;
-  };
+export interface MountVectorPrintStageResponse {
+  success: boolean;
+  snapshotCount: number;
+  error?: string;
 }
 
-export interface OffscreenBlobInitMessage {
-  type: 'OFFSCREEN_BLOB_INIT';
-  target: 'offscreen';
-  payload: {
-    jobId: string;
-    mimeType?: string;
-  };
+export interface ClearVectorSnapshotsMessage {
+  type: 'CLEAR_VECTOR_SNAPSHOTS';
 }
 
-export interface OffscreenBlobChunkMessage {
-  type: 'OFFSCREEN_BLOB_CHUNK';
-  target: 'offscreen';
-  payload: {
-    jobId: string;
-    base64Chunk: string;
-  };
-}
-
-export interface OffscreenBlobFinalizeMessage {
-  type: 'OFFSCREEN_BLOB_FINALIZE';
-  target: 'offscreen';
-  payload: {
-    jobId: string;
-  };
-}
-
-export interface OffscreenBlobRevokeMessage {
-  type: 'OFFSCREEN_BLOB_REVOKE';
-  target: 'offscreen';
-  payload: {
-    blobUrl: string;
-  };
+export interface TriggerWindowPrintMessage {
+  type: 'TRIGGER_WINDOW_PRINT';
 }
 
 export interface ExportProgressMessage {
@@ -268,10 +226,8 @@ export interface ExportCompleteMessage {
     filename: string;
     totalChapters: number;
     totalPdfPages?: number;
-    bookmarkCount?: number;
-    outputBytes?: number;
     isPartial?: boolean;
-    downloadId?: number;
+    vectorSaveStatus?: VectorSaveStatus;
     summary?: BatchExportSummary;
   };
 }
@@ -301,18 +257,13 @@ export type ExtensionMessage =
   | ToggleWidgetMessage
   | StartExportMessage
   | StartTestPrintMessage
-  | PrintIsolatedPageMessage
   | StopExportMessage
   | PrepareForPrintMessage
   | RestoreAfterPrintMessage
-  | DownloadPdfBlobMessage
-  | DownloadPdfChunkInitMessage
-  | DownloadPdfChunkAppendMessage
-  | DownloadPdfChunkFinalizeMessage
-  | OffscreenBlobInitMessage
-  | OffscreenBlobChunkMessage
-  | OffscreenBlobFinalizeMessage
-  | OffscreenBlobRevokeMessage
+  | CaptureVectorSnapshotMessage
+  | MountVectorPrintStageMessage
+  | ClearVectorSnapshotsMessage
+  | TriggerWindowPrintMessage
   | ExportProgressMessage
   | ExportCompleteMessage
   | ExportErrorMessage;
